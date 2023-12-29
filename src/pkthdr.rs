@@ -6,42 +6,59 @@ use paste::paste;
 use crate::type_alias::*;
 
 macro_rules! impl_accessor {
-    ($field:ident, $field_ty:ty, $integral_ty:ty, $lsb:expr, $msb:expr, $setter:tt, $getter:tt) => {
+    (
+        Field = $field:ident,
+        Self = $SelfT:ty, 
+        ActualT = $ActualT:ty,
+        lsb = $lsb:expr, 
+        msb = $msb:expr, 
+        setter = $setter:tt,
+        getter = $getter:tt) => {
+
         #[inline(always)]
-        pub fn $setter(&mut self, val: $field_ty) {
-            self.bits[$lsb..=$msb].store_le::<$integral_ty>(val as $integral_ty);
+        pub fn $setter(&mut self, val: $SelfT) {
+            self.bits[$lsb..=$msb].store_le::<$ActualT>(val as $ActualT);
         }
 
         #[inline(always)]
-        pub fn $getter(&self) -> $field_ty {
-            self.bits[$lsb..=$msb].load_le::<$integral_ty>().into()
+        pub fn $getter(&self) -> $SelfT {
+            self.bits[$lsb..=$msb].load_le::<$ActualT>().into()
         }
     };
 
-    ($field:ident, $field_ty:ty, $integral_ty:ty, $lsb:expr, $msb:expr) => {
+    (
+        Field = $field:ident,
+        Self = $SelfT:ty,
+        ActualT = $ActualT:ty,
+        lsb = $lsb:expr, 
+        msb = $msb:expr
+    ) => {
         paste! {
             impl_accessor!(
-                $field,
-                $field_ty,
-                $integral_ty,
-                $lsb,
-                $msb,
-                [< set_ $field >],
-                $field
+                Field = $field,
+                Self = $SelfT,
+                ActualT = $ActualT,
+                lsb = $lsb,
+                msb = $msb,
+                setter = [< set_ $field >],
+                getter = $field
             );
         }
     };
 
-    ($field:ident, $field_ty:ty, $lsb:expr, $msb:expr) => {
+    (
+        Field = $field:ident,
+        Self = $SelfT:ty,
+        lsb = $lsb:expr,
+        msb = $msb:expr
+    ) => {
         paste! {
             impl_accessor!(
-                $field,
-                $field_ty,
-                $field_ty,
-                $lsb,
-                $msb,
-                [< set_ $field >],
-                $field
+                Field = $field,
+                Self = $SelfT,
+                ActualT = $SelfT,
+                lsb = $lsb,
+                msb = $msb
             );
         }
     };
@@ -51,26 +68,26 @@ macro_rules! impl_accessor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum PktType {
-    /// Request data.
-    Req = 0,
+    /// Single-packet request.
+    SmallReq = 0,
 
-    /// Request for response.
-    Rfr = 1,
+    /// Control packet for a large request.
+    LargeReqCtrl = 1,
 
-    /// Explicit credit return.
-    ExplCR = 2,
+    /// Single-packet response.
+    SmallResp = 2,
 
-    /// Response data.
-    Resp = 3,
+    /// Control packet for a large response.
+    LargeRespCtrl = 3,
 }
 
 impl From<u8> for PktType {
     fn from(val: u8) -> Self {
         match val {
-            0 => Self::Req,
-            1 => Self::Rfr,
-            2 => Self::ExplCR,
-            3 => Self::Resp,
+            0 => Self::SmallReq,
+            1 => Self::LargeReqCtrl,
+            2 => Self::SmallResp,
+            3 => Self::LargeRespCtrl,
 
             // SAFETY: only used by `PacketHeader::pkt_type()`, which will only
             // pass 2-bit values to this function.
@@ -83,14 +100,13 @@ impl From<u8> for PktType {
 ///
 /// # Layout
 ///
-/// | Lsb | Msb |     Name     |
+/// | lsb | msb |     Name     |
 /// | --: | --: | ------------ |
 /// |   0 |   7 | req_type     |
 /// |   8 |  31 | len          |
 /// |  32 |  63 | dst_sess_id  |
-/// |  64 |  65 | pkt_type     |
-/// |  66 |  79 | pkt_idx      |
-/// |  80 | 127 | req_idx      |
+/// |  64 | 125 | req_idx      |
+/// | 126 | 127 | pkt_type     |
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub(crate) struct PacketHeader {
@@ -98,28 +114,25 @@ pub(crate) struct PacketHeader {
 }
 
 impl PacketHeader {
-    impl_accessor!(req_type, ReqType, 0, 7);
-    impl_accessor!(data_len, u32, 8, 31);
-    impl_accessor!(dst_sess_id, SessId, 32, 63);
-    impl_accessor!(pkt_type, PktType, u8, 64, 65);
-    impl_accessor!(pkt_idx, PktIdx, 66, 79);
-    impl_accessor!(req_idx, ReqIdx, 80, 127);
+    impl_accessor!(Field = req_type, Self = ReqType, lsb = 0, msb = 7);
+    impl_accessor!(Field = data_len, Self = u32, lsb = 8, msb = 31);
+    impl_accessor!(Field = dst_sess_id, Self = SessId, lsb = 32, msb = 63);
+    impl_accessor!(Field = req_idx, Self = ReqIdx, lsb = 64, msb = 125);
+    impl_accessor!(Field = pkt_type, Self = PktType, ActualT = u8, lsb = 126, msb = 127);
 
     pub fn new(
         req_type: ReqType,
         data_len: u32,
         dst_sess_id: SessId,
-        pkt_type: PktType,
-        pkt_idx: PktIdx,
         req_idx: ReqIdx,
+        pkt_type: PktType,
     ) -> Self {
         let mut this = Self::default();
         this.set_req_type(req_type);
         this.set_data_len(data_len);
         this.set_dst_sess_id(dst_sess_id);
-        this.set_pkt_type(pkt_type);
-        this.set_pkt_idx(pkt_idx);
         this.set_req_idx(req_idx);
+        this.set_pkt_type(pkt_type);
         this
     }
 }
@@ -127,12 +140,11 @@ impl PacketHeader {
 impl fmt::Debug for PacketHeader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PacketHeader")
-            .field("req_type", &self.req_type())
-            .field("len", &self.data_len())
             .field("dst_sess_id", &self.dst_sess_id())
             .field("pkt_type", &self.pkt_type())
-            .field("pkt_idx", &self.pkt_idx())
+            .field("req_type", &self.req_type())
             .field("req_idx", &self.req_idx())
+            .field("len", &self.data_len())
             .finish()
     }
 }

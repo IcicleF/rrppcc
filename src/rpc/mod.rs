@@ -7,30 +7,30 @@ use std::net::UdpSocket;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::{mem, ptr};
 
+use futures::future::FutureExt;
+use futures::task::noop_waker_ref;
 use rmp_serde as rmps;
 
 use self::pending::*;
-use crate::nexus::{Nexus, SmEvent, SmEventDetails, SmEventRx};
-use crate::pkthdr::*;
-use crate::session::*;
-use crate::transport::*;
-use crate::type_alias::*;
 use crate::util::{buddy::*, likely::*};
+use crate::{msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*, type_alias::*};
 
 /// Interior-mutable state of an [`Rpc`] instance.
-pub(crate) struct RpcInterior<Tp: UnreliableTransport> {
+pub(crate) struct RpcInterior {
     /// Sessions.
-    sessions: Vec<Session<Tp>>,
+    sessions: Vec<Session>,
 
     /// Buffer allocator.
-    buddy: BuddyAllocator,
+    allocator: *mut BuddyAllocator,
 
-    /// Transport layer.
-    tp: Tp,
+    /// RDMA UD transport layer.
+    tp: UdTransport,
 
     /// Pending RPC handlers.
-    pending_handlers: RefCell<Vec<PendingHandler>>,
+    pending_handlers: Vec<PendingHandler>,
 }
 
 /// Thread-local RPC endpoint.
@@ -39,47 +39,136 @@ pub(crate) struct RpcInterior<Tp: UnreliableTransport> {
 /// Available transports are provided in the [`crate::transport`] module.
 ///
 /// This is the main type of this library.
-pub struct Rpc<Tp: UnreliableTransport> {
+pub struct Rpc {
     /// ID of this RPC instance.
     id: RpcId,
     /// Nexus this RPC is bound to.
     nexus: Pin<Arc<Nexus>>,
 
     /// Session management packet sender.
+    /// Use a independent socket, no need to delegate to the Nexus.
     sm_tx: UdpSocket,
     /// Session management event receiver.
     sm_rx: SmEventRx,
 
     /// Interior-mutable state of this RPC.
-    state: RefCell<RpcInterior<Tp>>,
+    state: RefCell<RpcInterior>,
 
     /// Pending packet transmissions.
     ///
     /// Placed in a separate `RefCell`, so that when switched to RPC handler contexts,
     /// we do not need to borrow `RpcInterior` again.
-    pending_tx: RefCell<Vec<TxItem<Tp>>>,
+    pending_tx: RefCell<Vec<TxItem>>,
 }
 
-/// Internal progress.Rx routines.
-impl<Tp: UnreliableTransport> Rpc<Tp> {
-    fn process_small_request(&self, sslot: &mut SSlot, hdr: &mut PacketHeader) {
-        todo!()
+// Internal progress.Rx routines.
+impl Rpc {
+    /// Process a single-packet incoming request.
+    /// Return a future this request calls an asynchronous handler that cannot return immediately.
+    fn process_small_request(
+        &self,
+        state: &mut RpcInterior,
+        sess_id: SessId,
+        sslot_idx: usize,
+        hdr: &mut PacketHeader,
+    ) {
+        debug_assert_eq!(
+            hdr.pkt_type(),
+            PktType::SmallReq,
+            "packet type is not request"
+        );
+
+        let sess = &mut state.sessions[sess_id as usize];
+        let sslot = &mut sess.slots[sslot_idx];
+
+        // Fill in the SSlot fields.
+        sslot.req_idx = hdr.req_idx();
+        sslot.req_type = hdr.req_type();
+
+        // SAFETY: `hdr` is not null and properly aligned, and is right before the application data.
+        sslot.req =
+            unsafe { MsgBuf::borrowed(NonNull::new_unchecked(hdr), hdr.data_len() as _, 0) };
+
+        // Call the request handler to get a unexecuted future.
+        let req = Request::new(sslot);
+        let mut resp_fut = match self.nexus.call_rpc_handler(req) {
+            Some(fut) => fut,
+            None => {
+                log::warn!(
+                    "RPC {}: received request for unknown request type {:?}",
+                    self.id,
+                    hdr.req_type()
+                );
+                return;
+            }
+        };
+
+        // Immediately poll the future.
+        // This will make synchronous handlers return, and push asynchronous handlers
+        // into the first yield point.
+        let mut cx = Context::from_waker(noop_waker_ref());
+        match resp_fut.poll_unpin(&mut cx) {
+            Poll::Ready(resp) => {
+                assert!(
+                    resp.len() <= UdTransport::max_data_in_pkt(),
+                    "large response unimplemented yet"
+                );
+
+                // Write the packet header of this MsgBuf.
+                // SAFETY: `pkt_hdr` is not null and properly aligned, which is
+                // checked by `PacketHeader::pkt_hdr()`.
+                unsafe {
+                    ptr::write(
+                        resp.pkt_hdr(),
+                        PacketHeader::new(
+                            hdr.req_type(),
+                            resp.len() as _,
+                            hdr.dst_sess_id(),
+                            hdr.req_idx(),
+                            PktType::SmallResp,
+                        ),
+                    )
+                };
+
+                // Store the response buffer in the SSlot.
+                // Previous response buffer will be buried at this point.
+                sslot.resp = resp;
+
+                // Push the packet to the pending TX queue.
+                self.pending_tx.borrow_mut().push(TxItem {
+                    peer: sess.peer.as_ref().unwrap(),
+                    msgbuf: &sslot.resp,
+                })
+            }
+            Poll::Pending => state.pending_handlers.push(PendingHandler::new(
+                hdr.dst_sess_id(),
+                sslot_idx,
+                resp_fut,
+            )),
+        }
     }
 
-    fn process_response(&self, sslot: &mut SSlot, hdr: &mut PacketHeader) {
+    /// Process a response packet.
+    fn process_small_response(
+        &self,
+        state: &mut RpcInterior,
+        sess_id: SessId,
+        sslot_idx: usize,
+        hdr: &mut PacketHeader,
+    ) {
         todo!()
     }
 }
 
-/// Internal progress routines.
-impl<Tp: UnreliableTransport> Rpc<Tp> {
+// Internal progress routines.
+impl Rpc {
     /// Process received session management events.
     fn process_sm_events(&self) {
         // Abort if progressing recursively.
         let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
-        let state: &mut RpcInterior<Tp> = &mut state;
+        let state: &mut RpcInterior = &mut state;
 
         while let Some(event) = self.sm_rx.recv() {
             log::trace!("RPC {}: received SM event {:#?}", self.id, event);
@@ -90,7 +179,6 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
                     uri,
                     cli_ep,
                     cli_sess_id,
-                    credits,
                 } => {
                     // Endpoint deserialization error means some severe control-plane network error
                     // or a bug in the peer. Although we can ignore, the log level should be raised
@@ -103,11 +191,11 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
                         );
                         continue;
                     };
-                    let peer = state.tp.make_peer(cli_ep);
+                    let peer = state.tp.create_peer(cli_ep);
                     let svr_ep = rmps::to_vec(&state.tp.endpoint())
                         .expect("failed to serialize local endpoint");
 
-                    let mut sess = Session::new(self, SessionRole::Server, credits);
+                    let mut sess = Session::new(self, SessionRole::Server);
                     sess.peer_rpc_id = event.src_rpc_id;
                     sess.peer_sess_id = cli_sess_id;
                     sess.peer = Some(peer);
@@ -174,7 +262,7 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
                         );
                         continue;
                     };
-                    let peer = state.tp.make_peer(svr_ep);
+                    let peer = state.tp.create_peer(svr_ep);
 
                     sess.peer_sess_id = svr_sess_id;
                     sess.peer = Some(peer);
@@ -211,7 +299,7 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
         let Ok(mut state) = self.state.try_borrow_mut() else {
             return;
         };
-        let state: &mut RpcInterior<Tp> = &mut state;
+        let state: &mut RpcInterior = &mut state;
 
         // Do RX burst.
         let n = state.tp.rx_burst();
@@ -221,7 +309,7 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
             let item = state.tp.rx_next().expect("failed to fetch received packet");
 
             // SAFETY: guaranteed not null and aligned.
-            let hdr = unsafe { NonNull::new_unchecked(item.pkt_hdr(0)).as_mut() };
+            let hdr = unsafe { NonNull::new_unchecked(item.pkt_hdr()).as_mut() };
             if unlikely(state.sessions.len() as u32 <= hdr.dst_sess_id()) {
                 log::warn!(
                     "RPC {}: dropping received data-plane packet for non-existent session {}",
@@ -240,35 +328,46 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
             }
 
             let sslot_idx = hdr.req_idx() as usize % ACTIVE_REQ_WINDOW;
-            let sslot = &mut sess.slots[sslot_idx];
             match hdr.pkt_type() {
-                PktType::Req => {
-                    if likely(hdr.data_len() <= Tp::max_data_per_pkt() as u32) {
-                        self.process_small_request(sslot, hdr);
-                    } else {
-                        todo!("multi-packet message")
-                    }
+                PktType::SmallReq => {
+                    debug_assert!(hdr.data_len() <= UdTransport::max_data_in_pkt() as u32);
+                    self.process_small_request(state, hdr.dst_sess_id(), sslot_idx, hdr);
                 }
-                PktType::Resp => self.process_response(sslot, hdr),
-                PktType::Rfr => todo!(),
-                PktType::ExplCR => todo!(),
+                PktType::LargeReqCtrl => todo!("long request"),
+                PktType::SmallResp => {
+                    debug_assert!(hdr.data_len() <= UdTransport::max_data_in_pkt() as u32);
+                    self.process_small_response(state, hdr.dst_sess_id(), sslot_idx, hdr);
+                }
+                PktType::LargeRespCtrl => todo!("long response"),
             }
         }
     }
 
     /// Transmit pending packets.
     fn process_tx(&self) {
-        todo!()
+        // Abort if progressing recursively.
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return;
+        };
+        let state: &mut RpcInterior = &mut state;
+
+        let mut pending_tx = self.pending_tx.borrow_mut();
+        if unlikely(!pending_tx.is_empty()) {
+            // SAFETY: items in `pending_tx` all points to valid peers and `MsgBuf`s,
+            // which is guaranteed by `process_rx()` and `process_pending_handlers()`.
+            unsafe { state.tp.tx_burst(&pending_tx) };
+            pending_tx.clear();
+        }
     }
 
     /// Poll pending RPC handlers.
-    fn poll_pending_handlers(&self) {
+    fn process_pending_handlers(&self) {
         todo!()
     }
 }
 
-/// Thread-local RPC endpoint.
-impl<Tp: UnreliableTransport> Rpc<Tp> {
+// Public API.
+impl Rpc {
     /// Create a new `Rpc` instance that is bound to a [`Nexus`] with a certain
     /// ID. Will operate on the specified port of the given device.
     /// The given ID must be unique among all RPCs in the same Nexus.
@@ -288,9 +387,9 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
             sm_rx,
             state: RefCell::new(RpcInterior {
                 sessions: Vec::new(),
-                buddy: BuddyAllocator::new(),
-                tp: Tp::new(nic, phy_port),
-                pending_handlers: RefCell::new(Vec::new()),
+                allocator: Box::into_raw(Box::new(BuddyAllocator::new())),
+                tp: UdTransport::new(nic, phy_port),
+                pending_handlers: Vec::new(),
             }),
             pending_tx: RefCell::new(Vec::new()),
         }
@@ -300,6 +399,21 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
     #[inline(always)]
     pub fn id(&self) -> RpcId {
         self.id
+    }
+
+    /// Allocate a `MsgBuf` that can accommodate at least `len` bytes of
+    /// application data.
+    ///
+    /// The allocated `MsgBuf` will have an initial length of `len`, but the
+    /// contents are uninitialized.
+    #[inline]
+    pub fn alloc_msgbuf(&self, len: usize) -> MsgBuf {
+        let mut state = self.state.borrow_mut();
+
+        // SAFETY: validity of `allocator` ensured by constructor.
+        let allocator = Pin::new(unsafe { &mut *state.allocator });
+        let buf = allocator.alloc(len + mem::size_of::<PacketHeader>(), &mut state.tp);
+        MsgBuf::owned(buf, len)
     }
 
     /// Run an iteration of event loop to make progress.
@@ -320,14 +434,25 @@ impl<Tp: UnreliableTransport> Rpc<Tp> {
         // - Tx should be processed after polling pending handlers and
         //   Rx, because they may generate response packets to be sent
         //   in `pending_tx`.
-        self.poll_pending_handlers();
+        self.process_pending_handlers();
         self.process_rx();
         self.process_tx();
     }
 }
 
-impl<Tp: UnreliableTransport> Drop for Rpc<Tp> {
+impl Drop for Rpc {
     fn drop(&mut self) {
+        // Cleanup raw pointers.
+        {
+            let state = self.state.borrow_mut();
+
+            // SAFETY: the allocator is built by `Box::from_raw`, now just reclaim it.
+            unsafe {
+                drop(Box::from_raw(state.allocator));
+            }
+        }
+
+        // Destroy the SM event channel.
         self.nexus.destroy_event_channel(self.id);
     }
 }

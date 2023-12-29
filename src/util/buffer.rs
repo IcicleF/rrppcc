@@ -1,5 +1,7 @@
-use crate::transport::LocalKey;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
+
+use crate::transport::LKey;
+use crate::util::buddy::*;
 
 pub(crate) struct Buffer {
     /// Start address of the buffer.
@@ -9,21 +11,30 @@ pub(crate) struct Buffer {
     len: usize,
 
     /// Memory handle.
-    lkey: LocalKey,
+    lkey: LKey,
+
+    /// Pointer to the buddy allocator.
+    owner: *mut BuddyAllocator,
 }
 
 impl Buffer {
-    /// A real buffer.
-    pub fn real(buf: NonNull<u8>, len: usize, lkey: LocalKey) -> Self {
-        Self { buf, len, lkey }
+    /// A real buffer that will be deallocated when dropped.
+    pub fn real(owner: *mut BuddyAllocator, buf: NonNull<u8>, len: usize, lkey: LKey) -> Self {
+        Self {
+            buf,
+            len,
+            lkey,
+            owner,
+        }
     }
 
-    /// A fake buffer.
-    pub fn fake(lkey: LocalKey) -> Self {
+    /// A fake buffer that only serves to record a LKey, and does nothing when dropped.
+    pub fn lkey_only(lkey: LKey) -> Self {
         Self {
             buf: NonNull::dangling(),
             len: 0,
             lkey,
+            owner: ptr::null_mut(),
         }
     }
 
@@ -41,21 +52,15 @@ impl Buffer {
 
     /// Get the memory handle of the buffer.
     #[inline]
-    pub fn lkey(&self) -> LocalKey {
+    pub fn lkey(&self) -> LKey {
         self.lkey
     }
+}
 
-    /// Split the buffer into two buffers.
-    #[inline]
-    pub fn split(self) -> (Buffer, Buffer) {
-        let len = self.len / 2;
-        let buf1 = Self::real(self.buf, len, self.lkey);
-        let buf2 = Self::real(
-            // SAFETY: guaranteed not null, within the same allocated memory buffer.
-            unsafe { NonNull::new_unchecked(self.buf.as_ptr().add(len)) },
-            len,
-            self.lkey,
-        );
-        (buf1, buf2)
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        // SAFETY: if the owner is not null, it must point to a valid BuddyAllocator.
+        // Return the buffer to the allocator.
+        NonNull::new(self.owner).map(|mut owner| unsafe { (*owner.as_mut()).free(self) });
     }
 }

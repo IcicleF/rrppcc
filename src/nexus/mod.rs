@@ -13,7 +13,7 @@ use rmp_serde as rmps;
 
 pub(crate) use self::event::*;
 use crate::msgbuf::MsgBuf;
-use crate::request::{ReqHandler, Request};
+use crate::request::{ReqHandler, ReqHandlerFuture, Request};
 use crate::type_alias::*;
 
 static NEXUS_CREATED: AtomicBool = AtomicBool::new(false);
@@ -78,6 +78,14 @@ impl Nexus {
     /// Destroy the event channel for the given RPC ID.
     pub(crate) fn destroy_event_channel(&self, rpc_id: RpcId) {
         self.sm.sm_evt_tx.remove(&rpc_id);
+    }
+
+    /// Call the registered RPC handler for the given request type.
+    #[inline]
+    pub(crate) fn call_rpc_handler(&self, req: Request) -> Option<ReqHandlerFuture> {
+        let req_type = req.req_type();
+        let handler = self.rpc_handlers[req_type as usize].as_ref()?;
+        Some(handler(req))
     }
 }
 

@@ -1,9 +1,9 @@
 use std::ptr::NonNull;
-use std::{cmp, mem, slice};
+use std::{mem, slice};
 
 use crate::pkthdr::*;
-use crate::transport::{LocalKey, UnreliableTransport};
-use crate::util::{buffer::*, likely::*, math::*};
+use crate::transport::LKey;
+use crate::util::{buddy::BuddyAllocator, buffer::*};
 
 pub struct MsgBuf {
     /// Pointer to the first *application data* byte.
@@ -15,9 +15,6 @@ pub struct MsgBuf {
     /// Valid data bytes in the MsgBuf.
     len: usize,
 
-    /// Max number of packets in the MsgBuf.
-    max_pkts: usize,
-
     /// Backing buffer.
     buffer: Buffer,
 }
@@ -25,17 +22,15 @@ pub struct MsgBuf {
 unsafe impl Send for MsgBuf {}
 unsafe impl Sync for MsgBuf {}
 
-/// Protected methods.
 impl MsgBuf {
-    /// Create a new MsgBuf on owned buffer.
-    pub(crate) fn owned<Tp: UnreliableTransport>(buf: Buffer, data_len: usize) -> Self {
-        let max_pkts = if data_len == 0 {
-            1
-        } else {
-            (data_len - 1) / Tp::max_data_per_pkt() + 1
-        };
+    /// Maximum application data bytes in a single `MsgBuf`.
+    pub const MAX_DATA_LEN: usize = BuddyAllocator::MAX_ALLOC_SIZE - mem::size_of::<PacketHeader>();
 
-        let overall_len = roundup(data_len, 8) + max_pkts * mem::size_of::<PacketHeader>();
+    /// Create a new MsgBuf on owned buffer.
+    pub(crate) fn owned(buf: Buffer, data_len: usize) -> Self {
+        assert!(data_len < Self::MAX_DATA_LEN);
+
+        let overall_len = data_len + mem::size_of::<PacketHeader>();
         assert!(
             overall_len <= buf.len(),
             "buffer too small: {} < {}",
@@ -46,8 +41,7 @@ impl MsgBuf {
         Self {
             // SAFETY: guaranteed not null.
             data: unsafe { NonNull::new_unchecked(buf.as_ptr()) },
-            max_pkts,
-            max_len: data_len,
+            max_len: buf.len() - mem::size_of::<PacketHeader>(),
             len: data_len,
             buffer: buf,
         }
@@ -58,36 +52,21 @@ impl MsgBuf {
     /// # Safety
     ///
     /// The header must point to a valid `PacketHeader` right before application data.
-    pub(crate) unsafe fn borrowed(hdr: NonNull<u8>, len: usize, lkey: LocalKey) -> Self {
+    pub(crate) unsafe fn borrowed(hdr: NonNull<PacketHeader>, data_len: usize, lkey: LKey) -> Self {
         Self {
-            data: NonNull::new_unchecked(hdr.as_ptr().add(mem::size_of::<PacketHeader>())),
-            max_pkts: 1,
-            max_len: len,
-            len,
-            buffer: Buffer::fake(lkey),
+            data: NonNull::new_unchecked(hdr.as_ptr().add(1) as *mut u8),
+            max_len: data_len,
+            len: data_len,
+            buffer: Buffer::lkey_only(lkey),
         }
     }
 
     /// Get a pointer to a packet header.
     #[inline]
-    pub(crate) fn pkt_hdr(&self, pkt_idx: usize) -> *mut PacketHeader {
-        debug_assert!(
-            pkt_idx < self.max_pkts,
-            "invalid packet index: max {}, got {}",
-            self.max_pkts - 1,
-            pkt_idx
-        );
-
+    pub(crate) fn pkt_hdr(&self) -> *mut PacketHeader {
         // SAFETY: header & application data must be within the same allocated buffer.
-        let hdr = unsafe {
-            if likely(pkt_idx == 0) {
-                self.data.as_ptr().sub(mem::size_of::<PacketHeader>())
-            } else {
-                self.data
-                    .as_ptr()
-                    .add(roundup(self.max_len, 8) + (pkt_idx - 1) * mem::size_of::<PacketHeader>())
-            }
-        };
+        let hdr = unsafe { self.data.as_ptr().sub(mem::size_of::<PacketHeader>()) };
+        debug_assert!(!hdr.is_null());
         debug_assert!(
             (hdr as usize) % mem::align_of::<PacketHeader>() == 0,
             "misaligned header"
@@ -95,28 +74,13 @@ impl MsgBuf {
         hdr as _
     }
 
-    /// Get the size of a packet.
-    #[inline]
-    pub(crate) fn pkt_size(&self, pkt_idx: usize, max_data_per_pkt: usize) -> usize {
-        debug_assert!(
-            pkt_idx < self.max_pkts,
-            "invalid packet index: max {}, got {}",
-            self.max_pkts - 1,
-            pkt_idx
-        );
-
-        let offset = pkt_idx * max_data_per_pkt;
-        mem::size_of::<PacketHeader>() + cmp::min(max_data_per_pkt, self.len - offset)
-    }
-
     /// Get the memory handle of the packet buffer.
     #[inline(always)]
-    pub(crate) fn lkey(&self) -> LocalKey {
+    pub(crate) fn lkey(&self) -> LKey {
         self.buffer.lkey()
     }
 }
 
-/// Public methods.
 impl MsgBuf {
     /// Return a pointer to the first *application data* byte.
     #[inline(always)]

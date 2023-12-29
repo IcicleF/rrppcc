@@ -3,7 +3,7 @@ name = "rrppcc"
 version = "0.1.1"
 edition = "2021"
 license = "MIT"
-description = "A simple, incomplete, and experimental Rust RPC engine on high-performance unreliable transport. The ultimate goal is eRPC, but it is still far away."
+description = "A high-performance userspace RDMA RPC engine."
 
 authors = ["Jian Gao <icicle.flw@gmail.com>"]
 repository = "https://github.com/IcicleF/rrppcc"

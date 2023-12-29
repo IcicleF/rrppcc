@@ -3,10 +3,11 @@ mod sslot;
 use std::array;
 use std::collections::VecDeque;
 
+use rrddmma::rdma::qp::QpPeer;
+
 pub(crate) use self::sslot::*;
 use crate::msgbuf::MsgBuf;
 use crate::rpc::Rpc;
-use crate::transport::UnreliableTransport;
 use crate::type_alias::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +29,7 @@ struct PendingRequest {
 
 pub(crate) const ACTIVE_REQ_WINDOW: usize = 8;
 
-pub(crate) struct Session<Tp: UnreliableTransport> {
+pub(crate) struct Session {
     /// Role of this session.
     role: SessionRole,
 
@@ -39,10 +40,7 @@ pub(crate) struct Session<Tp: UnreliableTransport> {
     pub peer_sess_id: SessId,
 
     /// Remote peer routing information.
-    pub peer: Option<Tp::Peer>,
-
-    /// Session credits.
-    credits: usize,
+    pub peer: Option<QpPeer>,
 
     /// Session request slots.
     pub slots: [SSlot; ACTIVE_REQ_WINDOW],
@@ -51,9 +49,9 @@ pub(crate) struct Session<Tp: UnreliableTransport> {
     req_backlog: VecDeque<PendingRequest>,
 }
 
-impl<Tp: UnreliableTransport> Session<Tp> {
+impl Session {
     /// Create a new session.
-    pub fn new(rpc: &Rpc<Tp>, role: SessionRole, credits: usize) -> Self {
+    pub fn new(rpc: &Rpc, role: SessionRole) -> Self {
         // FIXME: initialize slots.
         let slots = array::from_fn(|_| todo!());
         Self {
@@ -61,7 +59,6 @@ impl<Tp: UnreliableTransport> Session<Tp> {
             peer_rpc_id: rpc.id(),
             peer_sess_id: 0,
             peer: None,
-            credits,
             slots,
             req_backlog: VecDeque::new(),
         }

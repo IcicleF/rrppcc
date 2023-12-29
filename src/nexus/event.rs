@@ -25,7 +25,6 @@ pub(crate) enum SmEventDetails {
         uri: SocketAddr,
         cli_ep: Vec<u8>,
         cli_sess_id: SessId,
-        credits: usize,
     },
 
     /// Positive response of a `ConnectRequest`.

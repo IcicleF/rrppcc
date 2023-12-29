@@ -11,9 +11,21 @@ use rrddmma::{
     },
 };
 
-use super::*;
+use crate::msgbuf::MsgBuf;
 use crate::pkthdr::PacketHeader;
 use crate::util::{huge_alloc::*, likely::*};
+
+/// Memory region handle type.
+pub type LKey = rrddmma::rdma::type_alias::LKey;
+
+/// An item to transmit.
+pub(crate) struct TxItem {
+    /// Peer for this packet.
+    pub peer: *const QpPeer,
+
+    /// Message buffer.
+    pub msgbuf: *const MsgBuf,
+}
 
 /// Received but unreturned message metadata.
 struct RxItem {
@@ -24,9 +36,9 @@ struct RxItem {
     len: u16,
 }
 
-/// RDMA unreliable datagram transport.
-pub struct IbTransport {
-    /// Queue pair.
+/// RDMA UD transport.
+pub(crate) struct UdTransport {
+    /// The UD queue pair.
     qp: Qp,
     /// Memory region registry.
     mrs: Vec<Mr>,
@@ -35,7 +47,7 @@ pub struct IbTransport {
     /// Used to check whether to signal a batch of send requests.
     tx_pkt_idx: usize,
     /// Send SGE buffer.
-    tx_sgl: Vec<[ibv_sge; 2]>,
+    tx_sgl: Vec<ibv_sge>,
     /// Send work request buffer.
     tx_wr: Vec<ibv_send_wr>,
 
@@ -61,7 +73,9 @@ pub struct IbTransport {
 
 const CACHELINE_SIZE: usize = 64;
 
-impl IbTransport {
+impl UdTransport {
+    const ROUTING_INFO_LEN: usize = 32;
+
     const GRH_SIZE: usize = 40;
     const MTU: usize = 1 << 12;
     const MAX_PKT_SIZE: usize = Self::MTU - mem::size_of::<PacketHeader>();
@@ -76,33 +90,32 @@ impl IbTransport {
     const RX_UNIT_SIZE: usize = Self::GRH_SIZE + Self::MTU;
 }
 
-impl IbTransport {
+impl UdTransport {
     /// Get the offset of the `i`-th receive unit in the entire buffer.
     /// This will point to the beginning of the GRH.
     #[inline(always)]
     const fn rx_offset(i: usize) -> usize {
-        i * IbTransport::RX_UNIT_ALLOC_SIZE + (CACHELINE_SIZE - IbTransport::GRH_SIZE)
+        i * UdTransport::RX_UNIT_ALLOC_SIZE + (CACHELINE_SIZE - UdTransport::GRH_SIZE)
     }
 
     /// Get the offset of the `i`-th receive unit's payload in the entire buffer.
     /// This will point to the beginning of the payload, usually the packet header.
     #[inline(always)]
     const fn rx_payload_offset(i: usize) -> usize {
-        i * IbTransport::RX_UNIT_ALLOC_SIZE + CACHELINE_SIZE
+        i * UdTransport::RX_UNIT_ALLOC_SIZE + CACHELINE_SIZE
     }
 }
 
-impl UnreliableTransport for IbTransport {
-    type Endpoint = QpEndpoint;
-    type Peer = QpPeer;
-
-    fn new(nic: &str, phy_port: u8) -> Self {
+impl UdTransport {
+    /// Create a new transport instance that is bound to a specific port on a
+    /// specific NIC.
+    pub fn new(nic: &str, phy_port: u8) -> Self {
         assert!(
             CACHELINE_SIZE >= Self::GRH_SIZE,
             "GRH too large, cannot fit in cacheline"
         );
         assert!(
-            Self::RQ_SIZE.trailing_zeros() < LocalKey::BITS,
+            Self::RQ_SIZE.trailing_zeros() < LKey::BITS,
             "too many recv units, index cannot fit in LocalKey"
         );
 
@@ -112,31 +125,36 @@ impl UnreliableTransport for IbTransport {
             .port_num(phy_port)
             .probe_nth_port(0)
             .expect("failed to find target NIC or physical port");
-        let pd = Pd::new(&context).expect("failed to allocate protection domain");
-        let send_cq = Cq::new(&context, Self::SQ_SIZE as _).expect("failed to allocate send CQ");
-        let recv_cq = Cq::new(&context, Self::RQ_SIZE as _).expect("failed to allocate recv CQ");
-        let mut qp = Qp::builder()
-            .qp_type(QpType::Ud)
-            .send_cq(&send_cq)
-            .recv_cq(&recv_cq)
-            .caps(QpCaps {
-                max_send_wr: Self::SQ_SIZE as _,
-                max_recv_wr: Self::RQ_SIZE as _,
-                max_send_sge: 2,
-                max_recv_sge: 1,
-                ..QpCaps::default()
-            })
-            .sq_sig_all(false)
-            .build(&pd)
-            .expect("failed to create queue pair");
-
         let port = ports.into_iter().next().unwrap();
         assert!(
             port.mtu().bytes() == Self::mtu(),
             "path active MTU must be 4KiB"
         );
-        qp.bind_local_port(&port, None)
-            .expect("failed to bind local port");
+
+        let pd = Pd::new(&context).expect("failed to allocate protection domain");
+        let qp = {
+            let send_cq =
+                Cq::new(&context, Self::SQ_SIZE as _).expect("failed to allocate UD send CQ");
+            let recv_cq =
+                Cq::new(&context, Self::RQ_SIZE as _).expect("failed to allocate RC recv CQ");
+            let mut qp = Qp::builder()
+                .qp_type(QpType::Ud)
+                .send_cq(&send_cq)
+                .recv_cq(&recv_cq)
+                .caps(QpCaps {
+                    max_send_wr: Self::SQ_SIZE as _,
+                    max_recv_wr: Self::RQ_SIZE as _,
+                    max_send_sge: 1,
+                    max_recv_sge: 1,
+                    ..QpCaps::default()
+                })
+                .sq_sig_all(false)
+                .build(&pd)
+                .expect("failed to create UD queue pair");
+            qp.bind_local_port(&port, None)
+                .expect("failed to bind UD QP to port");
+            qp
+        };
 
         // Create a peer for myself.
         let peer_to_myself = qp
@@ -144,11 +162,12 @@ impl UnreliableTransport for IbTransport {
             .expect("failed to create peer for myself");
 
         // Initialize send WRs.
-        let mut tx_sge = vec![[ibv_sge::default(); 2]; Self::SQ_SIZE + 1];
+        let mut tx_sgl = vec![ibv_sge::default(); Self::SQ_SIZE + 1];
         let mut tx_wr = (0..(Self::SQ_SIZE + 1))
             .map(|i| ibv_send_wr {
                 wr_id: i as _,
-                sg_list: tx_sge[i].as_mut_ptr(),
+                sg_list: &mut tx_sgl[i],
+                num_sge: 1,
                 opcode: ibv_wr_opcode::IBV_WR_SEND,
                 ..unsafe { mem::zeroed() }
             })
@@ -215,7 +234,7 @@ impl UnreliableTransport for IbTransport {
             mrs: vec![rx_mr],
 
             tx_pkt_idx: 0,
-            tx_sgl: tx_sge,
+            tx_sgl,
             tx_wr,
 
             rx_buf,
@@ -229,22 +248,39 @@ impl UnreliableTransport for IbTransport {
         }
     }
 
+    /// Return the MTU of the transport.
+    /// The MTU is the maximum data amount of a single packet.
     #[inline(always)]
-    fn mtu() -> usize {
+    pub const fn mtu() -> usize {
         Self::MTU
     }
 
-    fn endpoint(&self) -> Self::Endpoint {
+    /// Return the maximum amount of data that can be sent in a single packet.
+    /// This is the MTU minus the size of the packet header.
+    #[inline(always)]
+    pub const fn max_data_in_pkt() -> usize {
+        Self::MAX_PKT_SIZE
+    }
+
+    /// Return serialized endpoint information representing the transport instance.
+    pub fn endpoint(&self) -> QpEndpoint {
         self.qp.endpoint().unwrap()
     }
 
-    fn make_peer(&self, ep: Self::Endpoint) -> Self::Peer {
+    /// Construct a peer from the given endpoint information.
+    pub fn create_peer(&self, ep: QpEndpoint) -> QpPeer {
         self.qp
             .make_peer(&ep)
             .unwrap_or_else(|_| panic!("failed to create peer from endpoint {:?}", ep))
     }
 
-    unsafe fn reg_mem(&mut self, buf: *mut u8, len: usize) -> LocalKey {
+    /// Register memory so that it is accessible by the transport.
+    /// Return a handle to the registered memory region.
+    ///
+    /// # Safety
+    ///
+    /// The memory region `[buf, buf + len)` must be valid for access.
+    pub unsafe fn reg_mem(&mut self, buf: *mut u8, len: usize) -> LKey {
         let mr = Mr::reg(self.qp.pd(), buf, len, Permission::default())
             .expect("failed to register memory region");
         let lkey = mr.lkey();
@@ -252,7 +288,12 @@ impl UnreliableTransport for IbTransport {
         lkey
     }
 
-    unsafe fn tx_burst(&mut self, items: &[TxItem<Self>]) {
+    /// Transmit a batch of messages.
+    ///
+    /// # Safety
+    ///
+    /// The items in the batch must all be valid.
+    pub unsafe fn tx_burst(&mut self, items: &[TxItem]) {
         if items.is_empty() {
             return;
         }
@@ -271,9 +312,9 @@ impl UnreliableTransport for IbTransport {
 
         for (i, item) in items.iter().enumerate() {
             // SAFETY: the caller ensures that memory handles are valid.
-            let sgl = &mut self.tx_sgl[i];
+            let sge = &mut self.tx_sgl[i];
             let wr = &mut self.tx_wr[i];
-            debug_assert_eq!(wr.sg_list, sgl.as_mut_ptr());
+            debug_assert_eq!(wr.sg_list, sge as *mut _);
 
             // Set signaled flag + poll send CQ if needed.
             wr.send_flags = if self.tx_pkt_idx % Self::SQ_SIGNAL_BATCH == 0 {
@@ -287,24 +328,20 @@ impl UnreliableTransport for IbTransport {
             self.tx_pkt_idx += 1;
 
             // Fill in the scatter/gather list.
-            let msgbuf = &mut *item.msgbuf;
-            if likely(item.pkt_idx == 0) {
-                sgl[0] = ibv_sge {
-                    addr: msgbuf.pkt_hdr(0) as _,
-                    length: msgbuf.pkt_size(0, Self::MAX_PKT_SIZE) as _,
-                    lkey: msgbuf.lkey(),
-                };
-
-                wr.num_sge = 1;
-                if sgl[0].length <= self.qp.caps().max_inline_data {
-                    wr.send_flags |= ibv_send_flags::IBV_SEND_INLINE.0;
-                }
-            } else {
-                todo!("support multi-packet messages");
+            let msgbuf = &*item.msgbuf;
+            let length = msgbuf.len() as _;
+            *sge = ibv_sge {
+                addr: msgbuf.pkt_hdr() as _,
+                length,
+                lkey: msgbuf.lkey(),
+            };
+            if length <= self.qp.caps().max_inline_data {
+                wr.send_flags |= ibv_send_flags::IBV_SEND_INLINE.0;
             }
 
             // Fill in routing information.
-            (*item.peer).set_ud_peer(wr);
+            // Safety requirements should be upheld by the caller, no need to check here.
+            wr.wr.ud = unsafe { (*item.peer).ud() };
         }
 
         // Break the linked list chain.
@@ -319,7 +356,8 @@ impl UnreliableTransport for IbTransport {
         self.tx_wr[items.len() - 1].next = &mut self.tx_wr[items.len()] as *mut _;
     }
 
-    fn tx_drain(&mut self) {
+    /// Drain transmission queue.
+    pub fn tx_drain(&mut self) {
         if unlikely(self.tx_pkt_idx == 0) {
             return;
         }
@@ -362,7 +400,9 @@ impl UnreliableTransport for IbTransport {
         self.tx_pkt_idx = 0;
     }
 
-    fn rx_burst(&mut self) -> usize {
+    /// Receive a batch of messages.
+    /// Return the number of messages received.
+    pub fn rx_burst(&mut self) -> usize {
         let n = self
             .qp
             .rcq()
@@ -378,13 +418,14 @@ impl UnreliableTransport for IbTransport {
         n
     }
 
+    /// Return the next received message.
     #[inline]
-    fn rx_next(&mut self) -> Option<MsgBuf> {
+    pub fn rx_next(&mut self) -> Option<MsgBuf> {
         let RxItem { idx, len } = self.rx_items.pop_front()?;
         let offset = Self::rx_payload_offset(idx as _);
 
         // SAFETY: pointer guaranteed not-null, and within the same allocated buffer.
-        let buf = unsafe { NonNull::new_unchecked(self.rx_buf.ptr.add(offset)) };
+        let buf = unsafe { NonNull::new_unchecked(self.rx_buf.ptr.add(offset) as *mut _) };
 
         // Embed the index into the unused `lkey` so that we do not need to perform division
         // to recover it from the pointer during release.
@@ -393,10 +434,17 @@ impl UnreliableTransport for IbTransport {
         Some(msgbuf)
     }
 
-    unsafe fn rx_release(&mut self, items: impl Iterator<Item = MsgBuf>) {
+    /// Mark received messages as released and can be reused.
+    ///
+    /// # Safety
+    ///
+    /// - Only `MsgBuf` returned by `rx_next` can be released.
+    /// - Every `MsgBuf` must not be used after it is released.
+    /// - Every `MsgBuf` must not be released more than once.
+    pub unsafe fn rx_release(&mut self, items: &[MsgBuf]) {
         // Record the released buffer.
         for item in items {
-            self.rx_sge[self.rx_repost_pending].addr = item.pkt_hdr(0) as _;
+            self.rx_sge[self.rx_repost_pending].addr = item.pkt_hdr() as _;
             self.rx_wr[self.rx_repost_pending].wr_id = item.lkey() as _;
             self.rx_repost_pending += 1;
 
@@ -408,5 +456,18 @@ impl UnreliableTransport for IbTransport {
                 self.rx_repost_pending = 0;
             }
         }
+    }
+
+    /// Mark a received message as released and can be reused.
+    /// This is a convenience method for `rx_release` on [`iter::once(item)`].
+    ///
+    /// # Safety
+    ///
+    /// - Only `MsgBuf` returned by `rx_next` can be released.
+    /// - Every `MsgBuf` must not be used after it is released.
+    /// - Every `MsgBuf` must not be released more than once.
+    #[inline(always)]
+    pub unsafe fn rx_release_one(&mut self, item: MsgBuf) {
+        self.rx_release(&[item])
     }
 }
