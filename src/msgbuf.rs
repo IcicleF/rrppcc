@@ -27,6 +27,7 @@ impl MsgBuf {
     pub const MAX_DATA_LEN: usize = BuddyAllocator::MAX_ALLOC_SIZE - mem::size_of::<PacketHeader>();
 
     /// Create a new MsgBuf on owned buffer.
+    #[inline]
     pub(crate) fn owned(buf: Buffer, data_len: usize) -> Self {
         assert!(data_len < Self::MAX_DATA_LEN);
 
@@ -52,12 +53,29 @@ impl MsgBuf {
     /// # Safety
     ///
     /// The header must point to a valid `PacketHeader` right before application data.
+    #[inline]
     pub(crate) unsafe fn borrowed(hdr: NonNull<PacketHeader>, data_len: usize, lkey: LKey) -> Self {
         Self {
             data: NonNull::new_unchecked(hdr.as_ptr().add(1) as *mut u8),
             max_len: data_len,
             len: data_len,
-            buffer: Buffer::lkey_only(lkey),
+            buffer: Buffer::fake(lkey),
+        }
+    }
+
+    /// Clone a borrowed `MsgBuf`.
+    ///
+    /// # Panics
+    ///
+    /// Panic (in debug mode) if the `MsgBuf` is not borrowed.
+    #[inline]
+    pub(crate) fn clone_borrowed(&self) -> Self {
+        debug_assert!(self.buffer.is_fake(), "attempting to clone a owned MsgBuf");
+        Self {
+            data: self.data,
+            max_len: self.max_len,
+            len: self.len,
+            buffer: Buffer::fake(self.lkey()),
         }
     }
 

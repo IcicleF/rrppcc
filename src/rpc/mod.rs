@@ -72,8 +72,10 @@ impl Rpc {
         state: &mut RpcInterior,
         sess_id: SessId,
         sslot_idx: usize,
-        hdr: &PacketHeader,
+        req_msgbuf: &MsgBuf,
     ) -> bool {
+        // SAFETY: guaranteed not null and aligned.
+        let hdr = unsafe { NonNull::new_unchecked(req_msgbuf.pkt_hdr()).as_mut() };
         debug_assert_eq!(
             hdr.pkt_type(),
             PktType::SmallReq,
@@ -83,7 +85,7 @@ impl Rpc {
         // Check request type sanity.
         let req_type = hdr.req_type();
         if unlikely(!self.nexus.has_rpc_handler(req_type)) {
-            log::warn!(
+            log::debug!(
                 "RPC {}: dropping received SmallRequest for unknown request type {:?}",
                 self.id,
                 req_type
@@ -99,7 +101,7 @@ impl Rpc {
         if unlikely(req_idx <= sslot.req_idx) {
             // Simply drop outdated requests.
             if req_idx < sslot.req_idx {
-                log::warn!(
+                log::debug!(
                     "RPC {}: dropping received SmallRequest for outdated request (idx {}, ty {})",
                     self.id,
                     req_idx,
@@ -110,7 +112,7 @@ impl Rpc {
                 // RPCs should finish in a short time, so likely finished but packet lost.
                 if likely(sslot.finished) {
                     // If the request is already finished, we need to retransmit the response.
-                    log::info!(
+                    log::debug!(
                         "RPC {}: retransmitting possibly-lost response for request (idx {}, ty {})",
                         self.id,
                         req_idx,
@@ -123,7 +125,7 @@ impl Rpc {
                 } else {
                     // If the request is simply not finished, we have nothing to do.
                     // Let the client wait.
-                    log::info!(
+                    log::debug!(
                         "RPC {}: client urging for response of request (idx {}, ty {}), but it is not finished yet",
                         self.id,
                         req_idx,
@@ -140,14 +142,8 @@ impl Rpc {
         sslot.req_idx = req_idx;
         sslot.req_type = req_type;
 
-        // SAFETY: `hdr` is not null and properly aligned, and is right before the application data.
-        sslot.req = unsafe {
-            MsgBuf::borrowed(
-                NonNull::new_unchecked(hdr as *const _ as *mut _),
-                hdr.data_len() as _,
-                0,
-            )
-        };
+        // Use `MsgBuf::clone_borrowed()` to keep the lkey, which is needed when releasing the buffer.
+        sslot.req = req_msgbuf.clone_borrowed();
 
         // Call the request handler to get a unexecuted future.
         let req = Request::new(sslot);
@@ -183,6 +179,7 @@ impl Rpc {
                 // Store the response buffer in the SSlot.
                 // Previous response buffer will be buried at this point.
                 sslot.resp = resp;
+                sslot.finished = true;
 
                 // Push the packet to the pending TX queue.
                 self.pending_tx.borrow_mut().push(TxItem {
@@ -224,7 +221,7 @@ impl Rpc {
                 hdr.req_idx() < sslot.req_idx,
                 "response for future request is impossible"
             );
-            log::warn!(
+            log::debug!(
                 "RPC {}: dropping received SmallResponse for expired request (idx {}, ty {})",
                 self.id,
                 hdr.req_idx(),
@@ -246,13 +243,7 @@ impl Rpc {
 // Internal progress routines.
 impl Rpc {
     /// Process received session management events.
-    fn process_sm_events(&self) {
-        // Abort if progressing recursively.
-        let Ok(mut state) = self.state.try_borrow_mut() else {
-            return;
-        };
-        let state: &mut RpcInterior = &mut state;
-
+    fn process_sm_events(&self, state: &mut RpcInterior) {
         while let Some(event) = self.sm_rx.recv() {
             log::trace!("RPC {}: received SM event {:#?}", self.id, event);
             debug_assert_eq!(event.dst_rpc_id, self.id, "bad SM event dispatch");
@@ -308,7 +299,7 @@ impl Rpc {
                     svr_sess_id,
                 } => {
                     if state.sessions.len() <= cli_sess_id as usize {
-                        log::warn!(
+                        log::debug!(
                             "RPC {}: ignoring ConnectAcknowledge for non-existent session {}",
                             self.id,
                             cli_sess_id
@@ -318,7 +309,7 @@ impl Rpc {
 
                     let sess = &mut state.sessions[cli_sess_id as usize];
                     if sess.is_connected() {
-                        log::warn!(
+                        log::debug!(
                             "RPC {}: ignoring ConnectAcknowledge for already-connected session {}",
                             self.id,
                             cli_sess_id
@@ -326,7 +317,7 @@ impl Rpc {
                         continue;
                     }
                     if sess.is_client() {
-                        log::warn!(
+                        log::debug!(
                             "RPC {}: ignoring ConnectAcknowledge for client session {}",
                             self.id,
                             cli_sess_id
@@ -355,7 +346,7 @@ impl Rpc {
                     reason,
                 } => {
                     if state.sessions.len() <= cli_sess_id as usize {
-                        log::warn!(
+                        log::debug!(
                             "RPC {}: ignoring ConnectRefuse for non-existent session {}",
                             self.id,
                             cli_sess_id
@@ -363,7 +354,7 @@ impl Rpc {
                         continue;
                     }
 
-                    log::warn!(
+                    log::debug!(
                         "RPC {}: session {} is refused by remote peer, due to {:?}",
                         self.id,
                         cli_sess_id,
@@ -377,13 +368,7 @@ impl Rpc {
     }
 
     /// Process received datapath packets.
-    fn process_rx(&self) {
-        // Abort if progressing recursively.
-        let Ok(mut state) = self.state.try_borrow_mut() else {
-            return;
-        };
-        let state: &mut RpcInterior = &mut state;
-
+    fn process_rx(&self, state: &mut RpcInterior) {
         // Do RX burst.
         let n = state.tp.rx_burst();
 
@@ -394,42 +379,43 @@ impl Rpc {
 
             // SAFETY: guaranteed not null and aligned.
             let hdr = unsafe { NonNull::new_unchecked(item.pkt_hdr()).as_mut() };
-            if unlikely(state.sessions.len() as u32 <= hdr.dst_sess_id()) {
-                log::warn!(
+            let sess_id = hdr.dst_sess_id();
+            if unlikely(state.sessions.len() as u32 <= sess_id) {
+                log::debug!(
                     "RPC {}: dropping received data-plane packet for non-existent session {}",
                     self.id,
-                    hdr.dst_sess_id()
+                    sess_id
                 );
             }
 
             // Perform session sanity check.
-            let sess = &state.sessions[hdr.dst_sess_id() as usize];
+            let sess = &state.sessions[sess_id as usize];
             if unlikely(!sess.is_connected()) {
-                log::warn!(
+                log::debug!(
                     "RPC {}: dropping received data-plane packet for non-connected session {}",
                     self.id,
-                    hdr.dst_sess_id()
+                    sess_id
                 );
             }
             match hdr.pkt_type() {
                 PktType::SmallReq | PktType::LargeReqCtrl => {
                     if unlikely(sess.is_client()) {
-                        log::warn!(
+                        log::debug!(
                             "RPC {}: dropping received {:?} for client session {}",
                             self.id,
                             hdr.pkt_type(),
-                            hdr.dst_sess_id()
+                            sess_id
                         );
                         continue;
                     }
                 }
                 PktType::SmallResp | PktType::LargeRespCtrl => {
                     if unlikely(!sess.is_client()) {
-                        log::warn!(
+                        log::debug!(
                             "RPC {}: dropping received {:?} for server session {}",
                             self.id,
                             hdr.pkt_type(),
-                            hdr.dst_sess_id()
+                            sess_id
                         );
                         continue;
                     }
@@ -439,7 +425,7 @@ impl Rpc {
             // Perform packet sanity check.
             if matches!(hdr.pkt_type(), PktType::SmallReq | PktType::SmallResp) {
                 if unlikely(hdr.data_len() > UdTransport::max_data_in_pkt() as u32) {
-                    log::warn!(
+                    log::debug!(
                         "RPC {}: dropping received {:?} with too large data length {}",
                         self.id,
                         hdr.pkt_type(),
@@ -453,19 +439,13 @@ impl Rpc {
             let sslot_idx = hdr.req_idx() as usize % ACTIVE_REQ_WINDOW;
             match hdr.pkt_type() {
                 PktType::SmallReq => {
-                    if self.process_small_request(state, hdr.dst_sess_id(), sslot_idx, hdr) {
+                    if self.process_small_request(state, sess_id, sslot_idx, &item) {
                         rx_bufs_to_release.push(item);
                     }
                 }
                 PktType::LargeReqCtrl => todo!("long request"),
                 PktType::SmallResp => {
-                    self.process_small_response(
-                        state,
-                        hdr.dst_sess_id(),
-                        sslot_idx,
-                        hdr,
-                        item.as_ptr(),
-                    );
+                    self.process_small_response(state, sess_id, sslot_idx, hdr, item.as_ptr());
                     rx_bufs_to_release.push(item);
                 }
                 PktType::LargeRespCtrl => todo!("long response"),
@@ -473,21 +453,15 @@ impl Rpc {
         }
 
         // Release the Rx buffers to the transport layer.
-        // SAFETY: `rx_bufs_to_release` contains valid pointers to Rx buffers, and each buffer
+        // SAFETY: `rx_bufs_to_release` contains valid Rx buffers, and each buffer
         // is only released once (which is this release).
-        if !rx_bufs_to_release.is_empty() {
-            unsafe { state.tp.rx_release(&rx_bufs_to_release) };
+        for item in rx_bufs_to_release {
+            unsafe { state.tp.rx_release(&item) };
         }
     }
 
     /// Transmit pending packets.
-    fn process_tx(&self) {
-        // Abort if progressing recursively.
-        let Ok(mut state) = self.state.try_borrow_mut() else {
-            return;
-        };
-        let state: &mut RpcInterior = &mut state;
-
+    fn process_tx(&self, state: &mut RpcInterior) {
         let mut pending_tx = self.pending_tx.borrow_mut();
         if unlikely(!pending_tx.is_empty()) {
             // SAFETY: items in `pending_tx` all points to valid peers and `MsgBuf`s,
@@ -498,8 +472,58 @@ impl Rpc {
     }
 
     /// Poll pending RPC handlers.
-    fn process_pending_handlers(&self) {
-        todo!()
+    fn process_pending_handlers(&self, state: &mut RpcInterior) {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        state.pending_handlers.retain_mut(|resp_fut| {
+            match resp_fut.poll_unpin(&mut cx) {
+                Poll::Ready(resp) => {
+                    assert!(
+                        resp.len() <= UdTransport::max_data_in_pkt(),
+                        "large response unimplemented yet"
+                    );
+
+                    let sess = &mut state.sessions[resp_fut.sess_id as usize];
+                    let sslot = &mut sess.slots[resp_fut.sslot_idx];
+
+                    // Release the request buffer.
+                    // SAFETY: this buffer is not released before because
+                    // - `process_small_request()` returns `false`, preventing it from getting
+                    //   released in `process_rx()`;
+                    // - previous polls to the handler future gives `Pending`, not doing anything
+                    //   to this buffer.
+                    unsafe { state.tp.rx_release(&sslot.req) };
+
+                    // Write the packet header of this MsgBuf.
+                    // SAFETY: `pkt_hdr` is not null and properly aligned, which is
+                    // checked by `PacketHeader::pkt_hdr()`.
+                    unsafe {
+                        ptr::write(
+                            resp.pkt_hdr(),
+                            PacketHeader::new(
+                                sslot.req_type,
+                                resp.len() as _,
+                                sess.peer_sess_id,
+                                sslot.req_idx,
+                                PktType::SmallResp,
+                            ),
+                        )
+                    };
+
+                    // Store the response buffer in the SSlot.
+                    // Previous response buffer will be buried at this point.
+                    sslot.resp = resp;
+                    sslot.finished = true;
+
+                    // Push the packet to the pending TX queue.
+                    self.pending_tx.borrow_mut().push(TxItem {
+                        peer: sess.peer.as_ref().unwrap(),
+                        msgbuf: &sslot.resp,
+                    });
+                    false
+                }
+                Poll::Pending => true,
+            }
+        });
     }
 }
 
@@ -514,6 +538,8 @@ impl Rpc {
     /// - Panic if the given ID is already used.
     /// - Panic if there is no such device or no such port.
     pub fn new(nexus: &Pin<Arc<Nexus>>, id: RpcId, nic: &str, phy_port: u8) -> Self {
+        const PREALLOC_SIZE: usize = 64;
+
         // Create the SM event channel first, so that it will immediately
         // panic if the given ID is already used.
         let sm_rx = nexus.register_event_channel(id);
@@ -526,9 +552,9 @@ impl Rpc {
                 sessions: Vec::new(),
                 allocator: Box::into_raw(Box::new(BuddyAllocator::new())),
                 tp: UdTransport::new(nic, phy_port),
-                pending_handlers: Vec::new(),
+                pending_handlers: Vec::with_capacity(PREALLOC_SIZE),
             }),
-            pending_tx: RefCell::new(Vec::new()),
+            pending_tx: RefCell::new(Vec::with_capacity(PREALLOC_SIZE)),
         }
     }
 
@@ -560,8 +586,15 @@ impl Rpc {
     /// - scheduling and (re)transmitting datapath packets.
     #[inline]
     pub fn progress(&self) {
+        // Abort if progressing recursively.
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return;
+        };
+        let state: &mut RpcInterior = &mut state;
+
+        // Deal with session management events, which should be rare.
         if unlikely(!self.sm_rx.is_empty()) {
-            self.process_sm_events();
+            self.process_sm_events(state);
         }
 
         // Ordering:
@@ -571,9 +604,9 @@ impl Rpc {
         // - Tx should be processed after polling pending handlers and
         //   Rx, because they may generate response packets to be sent
         //   in `pending_tx`.
-        self.process_pending_handlers();
-        self.process_rx();
-        self.process_tx();
+        self.process_pending_handlers(state);
+        self.process_rx(state);
+        self.process_tx(state);
     }
 }
 

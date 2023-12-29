@@ -12,7 +12,7 @@ pub(super) struct PendingHandler {
     pub sess_id: SessId,
 
     /// Slot ID.
-    pub slot_idx: usize,
+    pub sslot_idx: usize,
 
     /// RPC handler body.
     handler: ReqHandlerFuture,
@@ -21,10 +21,10 @@ pub(super) struct PendingHandler {
 impl PendingHandler {
     /// Create a new pending handler.
     #[inline]
-    pub fn new(sess_id: SessId, slot_idx: usize, handler: ReqHandlerFuture) -> Self {
+    pub fn new(sess_id: SessId, sslot_idx: usize, handler: ReqHandlerFuture) -> Self {
         Self {
             sess_id,
-            slot_idx,
+            sslot_idx,
             handler,
         }
     }

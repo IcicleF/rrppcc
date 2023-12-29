@@ -434,32 +434,7 @@ impl UdTransport {
         Some(msgbuf)
     }
 
-    /// Mark received messages as released and can be reused.
-    ///
-    /// # Safety
-    ///
-    /// - Only `MsgBuf` returned by `rx_next` can be released.
-    /// - Every `MsgBuf` must not be used after it is released.
-    /// - Every `MsgBuf` must not be released more than once.
-    pub unsafe fn rx_release(&mut self, items: &[MsgBuf]) {
-        // Record the released buffer.
-        for item in items {
-            self.rx_sge[self.rx_repost_pending].addr = item.pkt_hdr() as _;
-            self.rx_wr[self.rx_repost_pending].wr_id = item.lkey() as _;
-            self.rx_repost_pending += 1;
-
-            if unlikely(self.rx_repost_pending == Self::RQ_POSTLIST_SIZE) {
-                // SAFETY: all work requests are correctly constructed.
-                self.qp
-                    .post_raw_recv(&self.rx_wr[0])
-                    .expect("failed to post recv WRs");
-                self.rx_repost_pending = 0;
-            }
-        }
-    }
-
     /// Mark a received message as released and can be reused.
-    /// This is a convenience method for `rx_release` on [`iter::once(item)`].
     ///
     /// # Safety
     ///
@@ -467,7 +442,17 @@ impl UdTransport {
     /// - Every `MsgBuf` must not be used after it is released.
     /// - Every `MsgBuf` must not be released more than once.
     #[inline(always)]
-    pub unsafe fn rx_release_one(&mut self, item: MsgBuf) {
-        self.rx_release(&[item])
+    pub unsafe fn rx_release(&mut self, item: &MsgBuf) {
+        self.rx_sge[self.rx_repost_pending].addr = item.pkt_hdr() as _;
+        self.rx_wr[self.rx_repost_pending].wr_id = item.lkey() as _;
+        self.rx_repost_pending += 1;
+
+        if unlikely(self.rx_repost_pending == Self::RQ_POSTLIST_SIZE) {
+            // SAFETY: all work requests are correctly constructed.
+            self.qp
+                .post_raw_recv(&self.rx_wr[0])
+                .expect("failed to post recv WRs");
+            self.rx_repost_pending = 0;
+        }
     }
 }

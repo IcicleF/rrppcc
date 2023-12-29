@@ -19,6 +19,7 @@ pub(crate) struct Buffer {
 
 impl Buffer {
     /// A real buffer that will be deallocated when dropped.
+    #[inline]
     pub fn real(owner: *mut BuddyAllocator, buf: NonNull<u8>, len: usize, lkey: LKey) -> Self {
         Self {
             buf,
@@ -29,7 +30,8 @@ impl Buffer {
     }
 
     /// A fake buffer that only serves to record a LKey, and does nothing when dropped.
-    pub fn lkey_only(lkey: LKey) -> Self {
+    #[inline]
+    pub fn fake(lkey: LKey) -> Self {
         Self {
             buf: NonNull::dangling(),
             len: 0,
@@ -39,21 +41,27 @@ impl Buffer {
     }
 
     /// Get the start address of the buffer.
-    #[inline]
+    #[inline(always)]
     pub fn as_ptr(&self) -> *mut u8 {
         self.buf.as_ptr()
     }
 
     /// Get the length of the buffer.
-    #[inline]
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Get the memory handle of the buffer.
-    #[inline]
+    #[inline(always)]
     pub fn lkey(&self) -> LKey {
         self.lkey
+    }
+
+    /// Return `true` if this buffer is fake.
+    #[inline(always)]
+    pub fn is_fake(&self) -> bool {
+        self.owner.is_null()
     }
 }
 
