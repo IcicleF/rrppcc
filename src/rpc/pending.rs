@@ -14,7 +14,7 @@ pub(super) struct PendingHandler {
     /// Slot ID.
     pub sslot_idx: usize,
 
-    /// RPC handler body.
+    /// Request handler body.
     handler: ReqHandlerFuture,
 }
 

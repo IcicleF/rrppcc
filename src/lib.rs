@@ -6,9 +6,10 @@ mod pkthdr;
 mod request;
 mod rpc;
 mod session;
-pub mod transport;
+mod transport;
 pub mod type_alias;
 mod util;
 
 pub use self::nexus::Nexus;
 pub use self::rpc::Rpc;
+pub use self::session::SessionHandle as Session;

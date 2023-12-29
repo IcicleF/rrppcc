@@ -80,17 +80,17 @@ impl Nexus {
         self.sm.sm_evt_tx.remove(&rpc_id);
     }
 
-    /// Return `true` if the given request type is registered with a RPC handler.
+    /// Return `true` if the given request type is registered with a request handler.
     #[inline(always)]
     pub(crate) fn has_rpc_handler(&self, req_type: ReqType) -> bool {
         self.rpc_handlers[req_type as usize].is_some()
     }
 
-    /// Call the registered RPC handler for the given request type.
+    /// Call the registered request handler for the given request type.
     ///
     /// # Panics
     ///
-    /// Panic if there is no such RPC handler.
+    /// Panic if there is no such request handler.
     #[inline]
     pub(crate) fn call_rpc_handler(&self, req: Request) -> ReqHandlerFuture {
         let req_type = req.req_type();
@@ -109,7 +109,11 @@ impl Nexus {
     pub fn new(uri: impl ToSocketAddrs) -> Pin<Arc<Self>> {
         assert!(!NEXUS_CREATED.swap(true, Ordering::SeqCst));
 
-        let uri = uri.to_socket_addrs().unwrap().next().unwrap();
+        let uri = uri
+            .to_socket_addrs()
+            .expect("failed to resolve remote URI")
+            .next()
+            .expect("no such remote URI");
         let socket = UdpSocket::bind(uri).unwrap();
 
         const SOCKET_READ_TIMEOUT: time::Duration = time::Duration::from_millis(100);
@@ -138,7 +142,7 @@ impl Nexus {
         self.sm.uri
     }
 
-    /// Set the RPC handler for the given request ID.
+    /// Set the handler for the given request type.
     pub fn set_rpc_handler<H, F>(&mut self, req_id: ReqType, handler: H) -> &mut Self
     where
         H: Fn(Request) -> F + Send + Sync + 'static,

@@ -94,7 +94,7 @@ impl BuddyAllocator {
     /// Split a buffer of the given class into two buffers of the next lower class.
     #[inline]
     fn split(&mut self, class: usize) {
-        debug_assert!(class >= 1 && class < Self::NUM_CLASSES);
+        debug_assert!((1..Self::NUM_CLASSES).contains(&class));
         debug_assert!(!self.buddy[class].is_empty());
 
         let size_after_split = Self::size_of_class(class - 1);

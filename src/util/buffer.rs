@@ -67,8 +67,10 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        // SAFETY: if the owner is not null, it must point to a valid BuddyAllocator.
-        // Return the buffer to the allocator.
-        NonNull::new(self.owner).map(|mut owner| unsafe { (*owner.as_mut()).free(self) });
+        if let Some(mut owner) = NonNull::new(self.owner) {
+            // Return the buffer to the allocator.
+            // SAFETY: if the owner is not null, it must point to a valid BuddyAllocator.
+            unsafe { (*owner.as_mut()).free(self) };
+        }
     }
 }

@@ -17,6 +17,9 @@ pub struct MsgBuf {
 
     /// Backing buffer.
     buffer: Buffer,
+
+    /// Padding to 64 bytes.
+    _padding: [u8; 8],
 }
 
 unsafe impl Send for MsgBuf {}
@@ -45,6 +48,7 @@ impl MsgBuf {
             max_len: buf.len() - mem::size_of::<PacketHeader>(),
             len: data_len,
             buffer: buf,
+            _padding: [0; 8],
         }
     }
 
@@ -60,6 +64,7 @@ impl MsgBuf {
             max_len: data_len,
             len: data_len,
             buffer: Buffer::fake(lkey),
+            _padding: [0; 8],
         }
     }
 
@@ -76,6 +81,7 @@ impl MsgBuf {
             max_len: self.max_len,
             len: self.len,
             buffer: Buffer::fake(self.lkey()),
+            _padding: [0; 8],
         }
     }
 
@@ -150,7 +156,7 @@ impl MsgBuf {
     ///
     /// This method has the same safety requirements as [`std::slice::from_raw_parts_mut()`].
     #[inline(always)]
-    pub unsafe fn as_mut_slice(&self) -> &mut [u8] {
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         slice::from_raw_parts_mut(self.data.as_ptr(), self.len)
     }
 }

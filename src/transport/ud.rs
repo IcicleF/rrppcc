@@ -109,6 +109,7 @@ impl UdTransport {
 impl UdTransport {
     /// Create a new transport instance that is bound to a specific port on a
     /// specific NIC.
+    #[allow(clippy::assertions_on_constants)]
     pub fn new(nic: &str, phy_port: u8) -> Self {
         assert!(
             CACHELINE_SIZE >= Self::GRH_SIZE,
