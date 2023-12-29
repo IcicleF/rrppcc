@@ -23,6 +23,12 @@ pub(crate) struct SSlot {
     ///   No need for an `Option`, since burying a fake `MsgBuf` is an no-op.
     /// - For client: this is the user-provided response buffer.
     pub resp: MsgBuf,
+
+    /// Whether the request is finished.
+    /// - For server: this is set to `true` after the RPC handler returns
+    ///   and the response is recorded.
+    /// - For client: this is set to `true` after the response is received.
+    pub finished: bool,
 }
 
 impl SSlot {

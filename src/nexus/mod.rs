@@ -80,12 +80,22 @@ impl Nexus {
         self.sm.sm_evt_tx.remove(&rpc_id);
     }
 
+    /// Return `true` if the given request type is registered with a RPC handler.
+    #[inline(always)]
+    pub(crate) fn has_rpc_handler(&self, req_type: ReqType) -> bool {
+        self.rpc_handlers[req_type as usize].is_some()
+    }
+
     /// Call the registered RPC handler for the given request type.
+    ///
+    /// # Panics
+    ///
+    /// Panic if there is no such RPC handler.
     #[inline]
-    pub(crate) fn call_rpc_handler(&self, req: Request) -> Option<ReqHandlerFuture> {
+    pub(crate) fn call_rpc_handler(&self, req: Request) -> ReqHandlerFuture {
         let req_type = req.req_type();
-        let handler = self.rpc_handlers[req_type as usize].as_ref()?;
-        Some(handler(req))
+        let handler = self.rpc_handlers[req_type as usize].as_ref().unwrap();
+        handler(req)
     }
 }
 

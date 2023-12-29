@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::{mem, ptr};
+use std::{cmp, mem, ptr};
 
 use futures::future::FutureExt;
 use futures::task::noop_waker_ref;
@@ -64,44 +64,94 @@ pub struct Rpc {
 // Internal progress.Rx routines.
 impl Rpc {
     /// Process a single-packet incoming request.
-    /// Return a future this request calls an asynchronous handler that cannot return immediately.
+    /// Return `true` if the RPC handler returns immediately or not even called
+    /// (which means the caller can release the Rx buffer).
+    #[must_use = "you must the return value to decide whether to release the Rx buffer"]
     fn process_small_request(
         &self,
         state: &mut RpcInterior,
         sess_id: SessId,
         sslot_idx: usize,
-        hdr: &mut PacketHeader,
-    ) {
+        hdr: &PacketHeader,
+    ) -> bool {
         debug_assert_eq!(
             hdr.pkt_type(),
             PktType::SmallReq,
-            "packet type is not request"
+            "packet type is not small-request"
         );
+
+        // Check request type sanity.
+        let req_type = hdr.req_type();
+        if unlikely(!self.nexus.has_rpc_handler(req_type)) {
+            log::warn!(
+                "RPC {}: dropping received SmallRequest for unknown request type {:?}",
+                self.id,
+                req_type
+            );
+            return true;
+        }
 
         let sess = &mut state.sessions[sess_id as usize];
         let sslot = &mut sess.slots[sslot_idx];
 
+        // Check request index sanity.
+        let req_idx = hdr.req_idx();
+        if unlikely(req_idx <= sslot.req_idx) {
+            // Simply drop outdated requests.
+            if req_idx < sslot.req_idx {
+                log::warn!(
+                    "RPC {}: dropping received SmallRequest for outdated request (idx {}, ty {})",
+                    self.id,
+                    req_idx,
+                    req_type
+                );
+            } else {
+                // Here, this must be a retransmitted request.
+                // RPCs should finish in a short time, so likely finished but packet lost.
+                if likely(sslot.finished) {
+                    // If the request is already finished, we need to retransmit the response.
+                    log::info!(
+                        "RPC {}: retransmitting possibly-lost response for request (idx {}, ty {})",
+                        self.id,
+                        req_idx,
+                        req_type
+                    );
+                    self.pending_tx.borrow_mut().push(TxItem {
+                        peer: sess.peer.as_ref().unwrap(),
+                        msgbuf: &sslot.resp,
+                    });
+                } else {
+                    // If the request is simply not finished, we have nothing to do.
+                    // Let the client wait.
+                    log::info!(
+                        "RPC {}: client urging for response of request (idx {}, ty {}), but it is not finished yet",
+                        self.id,
+                        req_idx,
+                        req_type
+                    );
+                }
+            }
+            return true;
+        }
+
+        // Now that this must be a valid *new* request.
         // Fill in the SSlot fields.
-        sslot.req_idx = hdr.req_idx();
-        sslot.req_type = hdr.req_type();
+        sslot.finished = false;
+        sslot.req_idx = req_idx;
+        sslot.req_type = req_type;
 
         // SAFETY: `hdr` is not null and properly aligned, and is right before the application data.
-        sslot.req =
-            unsafe { MsgBuf::borrowed(NonNull::new_unchecked(hdr), hdr.data_len() as _, 0) };
+        sslot.req = unsafe {
+            MsgBuf::borrowed(
+                NonNull::new_unchecked(hdr as *const _ as *mut _),
+                hdr.data_len() as _,
+                0,
+            )
+        };
 
         // Call the request handler to get a unexecuted future.
         let req = Request::new(sslot);
-        let mut resp_fut = match self.nexus.call_rpc_handler(req) {
-            Some(fut) => fut,
-            None => {
-                log::warn!(
-                    "RPC {}: received request for unknown request type {:?}",
-                    self.id,
-                    hdr.req_type()
-                );
-                return;
-            }
-        };
+        let mut resp_fut = self.nexus.call_rpc_handler(req);
 
         // Immediately poll the future.
         // This will make synchronous handlers return, and push asynchronous handlers
@@ -121,10 +171,10 @@ impl Rpc {
                     ptr::write(
                         resp.pkt_hdr(),
                         PacketHeader::new(
-                            hdr.req_type(),
+                            sslot.req_type,
                             resp.len() as _,
-                            hdr.dst_sess_id(),
-                            hdr.req_idx(),
+                            sess.peer_sess_id,
+                            sslot.req_idx,
                             PktType::SmallResp,
                         ),
                     )
@@ -138,13 +188,15 @@ impl Rpc {
                 self.pending_tx.borrow_mut().push(TxItem {
                     peer: sess.peer.as_ref().unwrap(),
                     msgbuf: &sslot.resp,
-                })
+                });
+                true
             }
-            Poll::Pending => state.pending_handlers.push(PendingHandler::new(
-                hdr.dst_sess_id(),
-                sslot_idx,
-                resp_fut,
-            )),
+            Poll::Pending => {
+                state
+                    .pending_handlers
+                    .push(PendingHandler::new(sess_id, sslot_idx, resp_fut));
+                false
+            }
         }
     }
 
@@ -154,9 +206,40 @@ impl Rpc {
         state: &mut RpcInterior,
         sess_id: SessId,
         sslot_idx: usize,
-        hdr: &mut PacketHeader,
+        hdr: &PacketHeader,
+        data: *mut u8,
     ) {
-        todo!()
+        debug_assert_eq!(
+            hdr.pkt_type(),
+            PktType::SmallResp,
+            "packet type is not small-response"
+        );
+
+        let sess = &mut state.sessions[sess_id as usize];
+        let sslot = &mut sess.slots[sslot_idx];
+
+        // Check packet metadata sanity.
+        if unlikely(hdr.req_type() != sslot.req_type || hdr.req_idx() != sslot.req_idx) {
+            assert!(
+                hdr.req_idx() < sslot.req_idx,
+                "response for future request is impossible"
+            );
+            log::warn!(
+                "RPC {}: dropping received SmallResponse for expired request (idx {}, ty {})",
+                self.id,
+                hdr.req_idx(),
+                hdr.req_type()
+            );
+            return;
+        }
+
+        // Truncate response if needed.
+        let len = cmp::min(sslot.resp.capacity(), hdr.data_len() as usize);
+        sslot.resp.set_len(len);
+
+        // SAFETY: source is guaranteed to be valid, destination length checked, may not overlap.
+        unsafe { ptr::copy_nonoverlapping(data, sslot.resp.as_ptr(), len) };
+        sslot.finished = true;
     }
 }
 
@@ -304,7 +387,8 @@ impl Rpc {
         // Do RX burst.
         let n = state.tp.rx_burst();
 
-        // Fetch the received packets.
+        // Process the received packets.
+        let mut rx_bufs_to_release = Vec::with_capacity(n);
         for _ in 0..n {
             let item = state.tp.rx_next().expect("failed to fetch received packet");
 
@@ -318,7 +402,8 @@ impl Rpc {
                 );
             }
 
-            let sess = &mut state.sessions[hdr.dst_sess_id() as usize];
+            // Perform session sanity check.
+            let sess = &state.sessions[hdr.dst_sess_id() as usize];
             if unlikely(!sess.is_connected()) {
                 log::warn!(
                     "RPC {}: dropping received data-plane packet for non-connected session {}",
@@ -326,20 +411,72 @@ impl Rpc {
                     hdr.dst_sess_id()
                 );
             }
+            match hdr.pkt_type() {
+                PktType::SmallReq | PktType::LargeReqCtrl => {
+                    if unlikely(sess.is_client()) {
+                        log::warn!(
+                            "RPC {}: dropping received {:?} for client session {}",
+                            self.id,
+                            hdr.pkt_type(),
+                            hdr.dst_sess_id()
+                        );
+                        continue;
+                    }
+                }
+                PktType::SmallResp | PktType::LargeRespCtrl => {
+                    if unlikely(!sess.is_client()) {
+                        log::warn!(
+                            "RPC {}: dropping received {:?} for server session {}",
+                            self.id,
+                            hdr.pkt_type(),
+                            hdr.dst_sess_id()
+                        );
+                        continue;
+                    }
+                }
+            }
 
+            // Perform packet sanity check.
+            if matches!(hdr.pkt_type(), PktType::SmallReq | PktType::SmallResp) {
+                if unlikely(hdr.data_len() > UdTransport::max_data_in_pkt() as u32) {
+                    log::warn!(
+                        "RPC {}: dropping received {:?} with too large data length {}",
+                        self.id,
+                        hdr.pkt_type(),
+                        hdr.data_len()
+                    );
+                    continue;
+                }
+            }
+
+            // Trigger packet processing logic.
             let sslot_idx = hdr.req_idx() as usize % ACTIVE_REQ_WINDOW;
             match hdr.pkt_type() {
                 PktType::SmallReq => {
-                    debug_assert!(hdr.data_len() <= UdTransport::max_data_in_pkt() as u32);
-                    self.process_small_request(state, hdr.dst_sess_id(), sslot_idx, hdr);
+                    if self.process_small_request(state, hdr.dst_sess_id(), sslot_idx, hdr) {
+                        rx_bufs_to_release.push(item);
+                    }
                 }
                 PktType::LargeReqCtrl => todo!("long request"),
                 PktType::SmallResp => {
-                    debug_assert!(hdr.data_len() <= UdTransport::max_data_in_pkt() as u32);
-                    self.process_small_response(state, hdr.dst_sess_id(), sslot_idx, hdr);
+                    self.process_small_response(
+                        state,
+                        hdr.dst_sess_id(),
+                        sslot_idx,
+                        hdr,
+                        item.as_ptr(),
+                    );
+                    rx_bufs_to_release.push(item);
                 }
                 PktType::LargeRespCtrl => todo!("long response"),
             }
+        }
+
+        // Release the Rx buffers to the transport layer.
+        // SAFETY: `rx_bufs_to_release` contains valid pointers to Rx buffers, and each buffer
+        // is only released once (which is this release).
+        if !rx_bufs_to_release.is_empty() {
+            unsafe { state.tp.rx_release(&rx_bufs_to_release) };
         }
     }
 
