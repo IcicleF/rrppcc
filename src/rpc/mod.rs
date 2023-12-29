@@ -37,6 +37,19 @@ pub(crate) struct RpcInterior {
     pending_tx: Vec<TxItem>,
 }
 
+impl RpcInterior {
+    /// Drain the pending TX queue, start their transmission on the transport.
+    /// Also drain the send DMA queue if `drain_dma_queue` is set.
+    fn drain_tx_batch(&mut self, drain_dma_queue: bool) {
+        if !self.pending_tx.is_empty() {
+            // SAFETY: items in `pending_tx` all points to valid peers and `MsgBuf`s,
+            // which is guaranteed by `process_rx()` and `process_pending_handlers()`.
+            unsafe { self.tp.tx_burst(&self.pending_tx, drain_dma_queue) };
+            self.pending_tx.clear();
+        }
+    }
+}
+
 /// Thread-local RPC endpoint.
 ///
 /// This type accepts a generic type that specifies the transport layer.
@@ -128,10 +141,20 @@ impl Rpc {
                         req_idx,
                         req_type
                     );
+
+                    // Setup retransmission item.
                     state.pending_tx.push(TxItem {
                         peer: sess.peer.as_ref().unwrap(),
                         msgbuf: &sslot.resp,
                     });
+
+                    // Need to drain the DMA queue.
+                    // This is because a previous response might have already reached the client,
+                    // i.e., this is an actually unnecessary retransmission. But if a future
+                    // request is sent before this retransmission, the response can get corrupted.
+                    //
+                    // SAFETY: `item` points to a valid peer and `MsgBuf`.
+                    state.drain_tx_batch(true);
                 } else {
                     // If the request is simply not finished, we have nothing to do.
                     // Let the client wait.
@@ -509,16 +532,8 @@ impl Rpc {
     /// Transmit pending packets.
     fn process_tx(&self) {
         // Should not panic, as we have checked reentrancy in `progress()`.
-        let mut real_state = self.state.borrow_mut();
-        let state: &mut RpcInterior = &mut real_state;
-
-        // Drain Tx batch.
-        if unlikely(!state.pending_tx.is_empty()) {
-            // SAFETY: items in `pending_tx` all points to valid peers and `MsgBuf`s,
-            // which is guaranteed by `process_rx()` and `process_pending_handlers()`.
-            unsafe { state.tp.tx_burst(&state.pending_tx) };
-            state.pending_tx.clear();
-        }
+        let mut state = self.state.borrow_mut();
+        state.drain_tx_batch(false);
     }
 
     /// Poll pending request handlers.
@@ -551,6 +566,10 @@ impl Rpc {
         let state: &mut RpcInterior = &mut real_state;
 
         // First, put the pending handlers back to `state`.
+        debug_assert!(
+            state.pending_handlers.is_empty(),
+            "there should be no reentrant `progress()`, why are there new pending handlers?"
+        );
         mem::swap(&mut state.pending_handlers, &mut pending_handlers);
 
         // Then, transmit the responses.

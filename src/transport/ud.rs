@@ -66,21 +66,16 @@ pub(crate) struct UdTransport {
     rx_items: VecDeque<RxItem>,
     /// Number of pending receive work requests to repost.
     rx_repost_pending: usize,
-
-    /// Myself as a peer. Used for `tx_flush`.
-    peer_to_myself: QpPeer,
 }
 
 const CACHELINE_SIZE: usize = 64;
 
 impl UdTransport {
-    const ROUTING_INFO_LEN: usize = 32;
-
     const GRH_SIZE: usize = 40;
     const MTU: usize = 1 << 12;
     const MAX_PKT_SIZE: usize = Self::MTU - mem::size_of::<PacketHeader>();
 
-    const SQ_SIZE: usize = 1 << 8;
+    const SQ_SIZE: usize = 1 << 7;
     const SQ_SIGNAL_BATCH: usize = 1 << 6;
 
     const RQ_SIZE: usize = 1 << 12;
@@ -143,7 +138,7 @@ impl UdTransport {
                 .send_cq(&send_cq)
                 .recv_cq(&recv_cq)
                 .caps(QpCaps {
-                    max_send_wr: Self::SQ_SIZE as _,
+                    max_send_wr: Self::SQ_SIGNAL_BATCH as _,
                     max_recv_wr: Self::RQ_SIZE as _,
                     max_send_sge: 1,
                     max_recv_sge: 1,
@@ -157,14 +152,9 @@ impl UdTransport {
             qp
         };
 
-        // Create a peer for myself.
-        let peer_to_myself = qp
-            .make_peer(&qp.endpoint().unwrap())
-            .expect("failed to create peer for myself");
-
         // Initialize send WRs.
-        let mut tx_sgl = vec![ibv_sge::default(); Self::SQ_SIZE + 1];
-        let mut tx_wr = (0..(Self::SQ_SIZE + 1))
+        let mut tx_sgl = vec![ibv_sge::default(); Self::SQ_SIGNAL_BATCH + 1];
+        let mut tx_wr = (0..(Self::SQ_SIGNAL_BATCH + 1))
             .map(|i| ibv_send_wr {
                 wr_id: i as _,
                 sg_list: &mut tx_sgl[i],
@@ -173,7 +163,7 @@ impl UdTransport {
                 ..unsafe { mem::zeroed() }
             })
             .collect::<Vec<_>>();
-        for i in 0..Self::SQ_SIZE {
+        for i in 0..Self::SQ_SIGNAL_BATCH {
             tx_wr[i].next = &mut tx_wr[i + 1] as *mut _;
         }
 
@@ -244,8 +234,6 @@ impl UdTransport {
             rx_wc,
             rx_items,
             rx_repost_pending: 0,
-
-            peer_to_myself,
         }
     }
 
@@ -290,11 +278,12 @@ impl UdTransport {
     }
 
     /// Transmit a batch of messages.
+    /// Drain the send DMA queue if `drain` is set to true.
     ///
     /// # Safety
     ///
     /// The items in the batch must all be valid.
-    pub unsafe fn tx_burst(&mut self, items: &[TxItem]) {
+    pub unsafe fn tx_burst(&mut self, items: &[TxItem], drain: bool) {
         if items.is_empty() {
             return;
         }
@@ -306,11 +295,12 @@ impl UdTransport {
         if unlikely(items.len() > Self::SQ_SIGNAL_BATCH) {
             // SAFETY: recursion (induction).
             for chunk in items.chunks(Self::SQ_SIGNAL_BATCH) {
-                self.tx_burst(chunk);
+                self.tx_burst(chunk, drain);
             }
             return;
         }
 
+        // Now we are sure that the batch size is within the `SQ_SIGNAL_BATCH` limit.
         for (i, item) in items.iter().enumerate() {
             // SAFETY: the caller ensures that memory handles are valid.
             let sge = &mut self.tx_sgl[i];
@@ -348,6 +338,20 @@ impl UdTransport {
         // Break the linked list chain.
         self.tx_wr[items.len() - 1].next = ptr::null_mut();
 
+        // If we need to drain the send DMA queue, the last WR must be signaled.
+        // We also need to record the total number of outstanding signaled WRs.
+        let need_poll = if unlikely(drain) {
+            let last_wr = &mut self.tx_wr[items.len() - 1];
+            if last_wr.send_flags & ibv_send_flags::IBV_SEND_SIGNALED.0 != 0 {
+                1
+            } else {
+                last_wr.send_flags |= ibv_send_flags::IBV_SEND_SIGNALED.0;
+                2
+            }
+        } else {
+            0
+        };
+
         // SAFETY: all work requests are correctly constructed.
         self.qp
             .post_raw_send(&self.tx_wr[0])
@@ -355,50 +359,18 @@ impl UdTransport {
 
         // Restore the linked list chain.
         self.tx_wr[items.len() - 1].next = &mut self.tx_wr[items.len()] as *mut _;
-    }
 
-    /// Drain transmission queue.
-    pub fn tx_drain(&mut self) {
-        if unlikely(self.tx_pkt_idx == 0) {
-            return;
+        // Poll send CQ and check the completions if we need to drain the send DMA queue.
+        if unlikely(drain) {
+            let wcs = self
+                .qp
+                .scq()
+                .poll_blocking(need_poll)
+                .expect("failed to poll CQ");
+            for wc in wcs {
+                wc.ok().expect("failed to send");
+            }
         }
-
-        // There must be exactly one unpolled CQE. Poll it.
-        self.qp.scq().poll_one_blocking_consumed();
-
-        // Send a packet that will be dropped by myself.
-        let buf = [0u8; 1];
-        let mut sge = ibv_sge {
-            addr: buf.as_ptr() as _,
-            length: 1,
-            lkey: 0,
-        };
-
-        let mut wr = ibv_send_wr {
-            sg_list: &mut sge,
-            num_sge: 1,
-            opcode: ibv_wr_opcode::IBV_WR_SEND,
-            send_flags: (ibv_send_flags::IBV_SEND_INLINE | ibv_send_flags::IBV_SEND_SIGNALED).0,
-
-            // SAFETY: POD type.
-            ..unsafe { mem::zeroed() }
-        };
-
-        self.peer_to_myself.set_ud_peer(&mut wr);
-        wr.wr.ud.remote_qpn = 0;
-
-        // SAFETY: all work requests are correctly constructed.
-        unsafe {
-            self.qp
-                .post_raw_send(&wr)
-                .expect("failed to post send WR (tx_flush)");
-        }
-
-        // Poll the CQE.
-        self.qp.scq().poll_one_blocking_consumed();
-
-        // Reset signal counter.
-        self.tx_pkt_idx = 0;
     }
 
     /// Receive a batch of messages.
