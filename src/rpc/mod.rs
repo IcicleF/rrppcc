@@ -747,9 +747,9 @@ impl Rpc {
                 .unwrap();
 
             // Invariant: if there are pending requests, then the SSlot must be non-empty.
-            // So, request index is current index + backlog length * ACTIVE_REQ_WINDOW.
+            // So, request index is current index + (existing backlog length + 1) * ACTIVE_REQ_WINDOW.
             let req_idx =
-                sess.slots[sslot_idx].req_idx + (pending_len * ACTIVE_REQ_WINDOW) as ReqIdx;
+                sess.slots[sslot_idx].req_idx + ((pending_len + 1) * ACTIVE_REQ_WINDOW) as ReqIdx;
 
             // Fill in the packet header.
             // SAFETY: the destination buffer is guaranteed to be valid.
@@ -804,18 +804,15 @@ impl Rpc {
         let sess = &mut state.sessions[sess_id as usize];
         let sslot = &mut sess.slots[sslot_idx];
 
-        assert!(
-            sslot.req_idx >= req_idx,
-            "sslot {} req_idx {} > request req_idx {}, this shouldn't happen!",
-            sslot_idx,
-            sslot.req_idx,
-            req_idx
-        );
-
         // Request has already expired, so it must be finished.
         // Would this really happen?
         if unlikely(sslot.req_idx > req_idx) {
             return true;
+        }
+
+        // Request is still in the pending queue, so it must be unfinished.
+        if sslot.req_idx < req_idx {
+            return false;
         }
 
         // Now we must have `sslot.req_idx == req_idx`.

@@ -2,7 +2,7 @@
 
 use super::{type_alias::*, *};
 use std::{
-    ptr,
+    array, ptr,
     sync::{atomic::*, *},
     thread,
 };
@@ -62,7 +62,7 @@ fn connect_rpcs() {
 }
 
 #[test]
-fn single_request() {
+fn single_req() {
     const HELLO_WORLD: &str = "hello, world!";
     const RPC_HELLO: ReqType = 42;
 
@@ -117,7 +117,7 @@ fn single_request() {
 }
 
 #[test]
-fn multiple_requests() {
+fn multiple_reqs() {
     const HELLO_WORLD: &str = "hello, world!";
     const RPC_HELLO: ReqType = 42;
 
@@ -161,6 +161,72 @@ fn multiple_requests() {
         block_on(request);
 
         // Validation.
+        let payload = {
+            let mut payload = Vec::with_capacity(resp_buf.len());
+            unsafe {
+                ptr::copy_nonoverlapping(resp_buf.as_ptr(), payload.as_mut_ptr(), resp_buf.len());
+                payload.set_len(resp_buf.len());
+            }
+            String::from_utf8(payload).unwrap()
+        };
+        assert_eq!(payload, HELLO_WORLD);
+    }
+
+    tx.send(()).unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn concurrent_reqs_simple() {
+    const HELLO_WORLD: &str = "hello, world!";
+    const RPC_HELLO: ReqType = 42;
+
+    let (tx, rx) = mpsc::channel();
+    let (tx2, rx2) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut nx = Nexus::new("127.0.0.1:31858");
+        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+            let mut resp_buf = req.pre_resp_buf();
+            unsafe {
+                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+            };
+            resp_buf.set_len(HELLO_WORLD.len());
+            resp_buf
+        });
+
+        let rpc = Rpc::new(&nx, 2, "mlx5_0", 1);
+        tx2.send(()).unwrap();
+        while let Err(_) = rx.try_recv() {
+            rpc.progress();
+        }
+    });
+
+    let nx = Nexus::new("127.0.0.1:31857");
+    let rpc = Rpc::new(&nx, 1, "mlx5_0", 1);
+
+    rx2.recv().unwrap();
+    let sess = rpc.create_session("127.0.0.1:31858", 2);
+    assert!(block_on(sess.connect()));
+
+    // Multiple concurrent buffer & requests.
+    const N: usize = 64;
+    let req_bufs: [_; N] = array::from_fn(|_| rpc.alloc_msgbuf(16));
+    let mut resp_bufs: [_; N] = array::from_fn(|_| rpc.alloc_msgbuf(16));
+
+    // Issue requests.
+    let mut requests = Vec::with_capacity(N);
+    let mut resp_slice = &mut resp_bufs[..];
+    for i in 0..N {
+        let (resp, rest) = resp_slice.split_first_mut().unwrap();
+        requests.push(sess.request(RPC_HELLO, &req_bufs[i], resp));
+        resp_slice = rest;
+    }
+
+    // Wait for all requests to complete.
+    block_on(join_all(requests));
+
+    // Validation.
+    for resp_buf in resp_bufs {
         let payload = {
             let mut payload = Vec::with_capacity(resp_buf.len());
             unsafe {
