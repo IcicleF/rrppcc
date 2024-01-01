@@ -1,4 +1,3 @@
-use std::pin::Pin;
 use std::ptr::NonNull;
 
 use crate::transport::{LKey, UdTransport};
@@ -57,7 +56,7 @@ impl BuddyAllocator {
 
     /// Current buffer exhausted (for some size class allocation), so allocate new memory.
     #[cold]
-    fn reserve_memory(self: &mut Pin<&mut Self>, tp: &mut UdTransport) {
+    fn reserve_memory(&mut self, tp: &mut UdTransport) {
         let len = self.next_alloc;
         self.next_alloc *= 2;
         debug_assert!(len % Self::MAX_ALLOC_SIZE == 0);
@@ -77,12 +76,12 @@ impl BuddyAllocator {
     /// Return the size of a given class.
     #[inline]
     const fn size_of_class(class: usize) -> usize {
-        1 << (Self::MIN_ALLOC_SIZE + class)
+        Self::MIN_ALLOC_SIZE << class
     }
 
     /// Return the smallest class that can accommodate a given size.
     #[inline]
-    const fn class(len: usize) -> usize {
+    const fn class_of(len: usize) -> usize {
         let len = len.next_power_of_two();
         if len < Self::MIN_ALLOC_SIZE {
             0
@@ -119,14 +118,14 @@ impl BuddyAllocator {
     }
 
     /// Allocate a new buffer with at least the given length.
-    pub fn alloc(mut self: Pin<&mut Self>, len: usize, tp: &mut UdTransport) -> Buffer {
+    pub fn alloc(&mut self, len: usize, tp: &mut UdTransport) -> Buffer {
         assert!(
             len <= Self::MAX_ALLOC_SIZE,
             "requested buffer too large (maximum: {}MB)",
             Self::MAX_ALLOC_SIZE >> 20
         );
 
-        let class = Self::class(len);
+        let class = Self::class_of(len);
         if self.buddy[class].is_empty() {
             let higher_class =
                 ((class + 1)..Self::NUM_CLASSES).find(|&c| !self.buddy[c].is_empty());
@@ -142,17 +141,13 @@ impl BuddyAllocator {
             debug_assert!(!self.buddy[class].is_empty());
         }
         let buf = self.buddy[class].pop().unwrap();
-        Buffer::real(
-            Pin::into_inner(self) as _,
-            buf.buf,
-            Self::size_of_class(class),
-            buf.lkey,
-        )
+        Buffer::real(self, buf.buf, Self::size_of_class(class), buf.lkey)
     }
 
     /// Free a buffer.
+    /// This does not actually free the memory, but returns it to the buddy allocator.
     pub fn free(&mut self, buf: &mut Buffer) {
-        let class = Self::class(buf.len());
+        let class = Self::class_of(buf.len());
         self.buddy[class].push(InBuddyBuffer::new(
             // SAFETY: `buf.as_ptr()` returns the raw pointer stored in `NonNull`.
             unsafe { NonNull::new_unchecked(buf.as_ptr()) },

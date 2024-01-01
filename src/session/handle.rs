@@ -1,5 +1,14 @@
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use rmp_serde as rmps;
+
+use crate::nexus::{SmEvent, SmEventDetails};
 use crate::rpc::Rpc;
 use crate::type_alias::*;
+use crate::util::{likely::*, thread_check::*};
 
 pub struct SessionHandle<'r> {
     /// The RPC instance that owns this session.
@@ -7,20 +16,36 @@ pub struct SessionHandle<'r> {
 
     /// Session ID.
     sess_id: SessId,
+
+    /// Peer Nexus SM URI.
+    remote_uri: SocketAddr,
+
+    /// Peer Rpc ID.
+    remote_rpc_id: RpcId,
 }
 
 impl<'r> SessionHandle<'r> {
     /// Create a new session handle.
     #[inline(always)]
-    pub(crate) fn new(rpc: &'r Rpc, sess_id: SessId) -> Self {
-        Self { rpc, sess_id }
+    pub(crate) fn new(
+        rpc: &'r Rpc,
+        sess_id: SessId,
+        remote_uri: SocketAddr,
+        remote_rpc_id: RpcId,
+    ) -> Self {
+        Self {
+            rpc,
+            sess_id,
+            remote_uri,
+            remote_rpc_id,
+        }
     }
 }
 
 impl<'r> SessionHandle<'r> {
     /// Return the session ID.
     #[inline(always)]
-    pub fn sess_id(&self) -> SessId {
+    pub fn id(&self) -> SessId {
         self.sess_id
     }
 
@@ -28,5 +53,74 @@ impl<'r> SessionHandle<'r> {
     #[inline(always)]
     pub fn rpc(&self) -> &'r Rpc {
         self.rpc
+    }
+
+    /// Return `true` if the session is connected.
+    #[inline]
+    pub fn is_connected(&self) -> bool {
+        self.rpc
+            .session_connection_state(self.sess_id)
+            .unwrap_or(false)
+    }
+
+    /// Connect the session to the remote peer.
+    ///
+    /// This method returns an awaitable object that resolves to a
+    /// boolean value indicating whether the connection is successful.
+    pub fn connect<'a>(&'a self) -> impl Future<Output = bool> + 'a
+    where
+        'r: 'a,
+    {
+        if likely(!self.is_connected()) {
+            // Mark the session as connecting.
+            self.rpc.mark_session_connecting(self.sess_id);
+
+            // Send a connect request to the remote peer.
+            let ep = rmps::to_vec(&self.rpc.datagram_endpoint()).unwrap();
+            let event = SmEvent {
+                src_rpc_id: self.rpc.id(),
+                dst_rpc_id: self.remote_rpc_id,
+                details: SmEventDetails::ConnectRequest {
+                    cli_uri: self.rpc.nexus().uri(),
+                    cli_ep: ep,
+                    cli_sess_id: self.sess_id,
+                },
+            };
+
+            let event_buf = rmps::to_vec(&event).unwrap();
+            self.rpc
+                .sm_tx
+                .send_to(&event_buf, self.remote_uri)
+                .expect("failed to send ConnectRequest");
+        }
+
+        SessionConnect {
+            rpc: self.rpc,
+            sess_id: self.sess_id,
+        }
+    }
+}
+
+/// Session connection awaitable.
+struct SessionConnect<'a> {
+    /// The `Rpc` instance that owns this session.
+    rpc: &'a Rpc,
+
+    /// Session ID.
+    sess_id: SessId,
+}
+
+impl Future for SessionConnect<'_> {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        do_thread_check(self.rpc);
+        if let Some(result) = self.rpc.session_connection_state(self.sess_id) {
+            Poll::Ready(result)
+        } else {
+            self.rpc.progress();
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
     }
 }

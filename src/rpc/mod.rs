@@ -3,17 +3,20 @@
 mod pending;
 
 use std::cell::RefCell;
+use std::marker::PhantomPinned;
 use std::net::ToSocketAddrs;
 use std::net::UdpSocket;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::thread::{self, ThreadId};
 use std::{cmp, mem, ptr};
 
 use futures::future::FutureExt;
 use futures::task::noop_waker_ref;
 use rmp_serde as rmps;
+use rrddmma::rdma::qp::QpEndpoint;
 
 use self::pending::*;
 use crate::util::{buddy::*, likely::*};
@@ -24,9 +27,6 @@ pub(crate) struct RpcInterior {
     /// Sessions.
     sessions: Vec<Session>,
 
-    /// Buffer allocator.
-    allocator: *mut BuddyAllocator,
-
     /// RDMA UD transport layer.
     tp: UdTransport,
 
@@ -35,6 +35,10 @@ pub(crate) struct RpcInterior {
 
     /// Pending packet transmissions.
     pending_tx: Vec<TxItem>,
+
+    /// Buffer allocator.
+    /// This need to be the last one to drop.
+    allocator: BuddyAllocator,
 }
 
 impl RpcInterior {
@@ -50,6 +54,20 @@ impl RpcInterior {
     }
 }
 
+impl RpcInterior {
+    /// Allocate a `MsgBuf` that can accommodate at least `len` bytes of
+    /// application data. The allocated `MsgBuf` will have an initial length
+    /// of `len`, but its content are uninitialized.
+    #[inline]
+    pub fn alloc_msgbuf(&mut self, len: usize) -> MsgBuf {
+        // SAFETY: `self.allocator` is guaranteed to be valid.
+        let buf = self
+            .allocator
+            .alloc(len + mem::size_of::<PacketHeader>(), &mut self.tp);
+        MsgBuf::owned(buf, len)
+    }
+}
+
 /// Thread-local RPC endpoint.
 ///
 /// This type accepts a generic type that specifies the transport layer.
@@ -61,12 +79,17 @@ pub struct Rpc {
     id: RpcId,
     /// Nexus this RPC is bound to.
     nexus: Pin<Arc<Nexus>>,
+    /// The thread ID of the thread that created this RPC instance.
+    pub(crate) thread_id: ThreadId,
 
     /// Session management packet sender.
     /// Use a independent socket, no need to delegate to the Nexus.
-    sm_tx: UdpSocket,
+    pub(crate) sm_tx: UdpSocket,
     /// Session management event receiver.
     sm_rx: SmEventRx,
+
+    /// Cached transport endpoint information.
+    tp_ep: QpEndpoint,
 
     /// Interior-mutable state of this RPC.
     state: RefCell<RpcInterior>,
@@ -77,6 +100,9 @@ pub struct Rpc {
     /// when entering request handler contexts, but we still want to prevent reentrances
     /// of `progress()`.
     progressing: RefCell<()>,
+
+    /// Pinning marker to prevent moving around.
+    _pinned: PhantomPinned,
 }
 
 // Internal progress.Rx routines.
@@ -296,12 +322,12 @@ impl Rpc {
         let state: &mut RpcInterior = &mut real_state;
 
         while let Some(event) = self.sm_rx.recv() {
-            log::trace!("RPC {}: received SM event {:#?}", self.id, event);
+            log::trace!("RPC {}: received {:#?}", self.id, event);
             debug_assert_eq!(event.dst_rpc_id, self.id, "bad SM event dispatch");
 
             match event.details {
                 SmEventDetails::ConnectRequest {
-                    uri,
+                    cli_uri: uri,
                     cli_ep,
                     cli_sess_id,
                 } => {
@@ -319,11 +345,13 @@ impl Rpc {
                     let peer = state.tp.create_peer(cli_ep);
                     let svr_ep = rmps::to_vec(&state.tp.endpoint()).unwrap();
 
-                    let mut sess = Session::new(self, SessionRole::Server);
+                    // Setup a initially connected session.
+                    let mut sess = Session::new(state, SessionRole::Server);
                     sess.peer_uri = uri;
                     sess.peer_rpc_id = event.src_rpc_id;
                     sess.peer_sess_id = cli_sess_id;
                     sess.peer = Some(peer);
+                    sess.connected = Some(true);
 
                     let svr_sess_id = state.sessions.len() as SessId;
                     state.sessions.push(sess);
@@ -361,13 +389,15 @@ impl Rpc {
 
                     if unlikely(
                         sess.is_connected()
-                            || sess.is_client()
+                            || !sess.is_client()
                             || sess.peer_rpc_id != event.src_rpc_id,
                     ) {
                         log::debug!(
-                            "RPC {}: ignoring ConnectAcknowledge for client session {}, because of (connected_state, role, peer_rpc_id) mismatch",
+                            "RPC {}: ignoring ConnectAcknowledge for client session {}, because of (connected, role, peer_rpc_id) mismatch: expected {:?}, found {:?}",
                             self.id,
-                            cli_sess_id
+                            cli_sess_id,
+                            (false, SessionRole::Client, sess.peer_rpc_id),
+                            (sess.is_connected(), SessionRole::Server, event.src_rpc_id),
                         );
                         continue;
                     }
@@ -387,6 +417,7 @@ impl Rpc {
 
                     sess.peer_sess_id = svr_sess_id;
                     sess.peer = Some(peer);
+                    sess.connected = Some(true);
                 }
                 SmEventDetails::ConnectRefuse {
                     cli_sess_id,
@@ -620,11 +651,43 @@ impl Rpc {
     }
 }
 
+// Crate-internal API.
+impl Rpc {
+    /// Return `true` if the session of the given ID exists and is connected.
+    ///
+    /// # Panics
+    ///
+    /// - Panic if the session ID is invalid.
+    /// - Panic if called when `self.state` is already borrowed.
+    #[inline]
+    pub(crate) fn session_connection_state(&self, sess_id: SessId) -> Option<bool> {
+        self.state.borrow().sessions[sess_id as usize].connected
+    }
+
+    /// Mark a session as connecting in progress.
+    ///
+    /// # Panics
+    ///
+    /// - Panic if the session ID is invalid.
+    /// - Panic if the session is already connected.
+    #[inline]
+    pub(crate) fn mark_session_connecting(&self, sess_id: SessId) {
+        let mut real_state = self.state.borrow_mut();
+        let state: &mut RpcInterior = &mut real_state;
+
+        let sess = &mut state.sessions[sess_id as usize];
+        if let Some(true) = sess.connected {
+            panic!("session {} is already connected", sess_id);
+        }
+        sess.connected = None;
+    }
+}
+
 // Public API.
 impl Rpc {
     /// Create a new `Rpc` instance that is bound to a [`Nexus`] with a certain
-    /// ID. Will operate on the specified port of the given device.
-    /// The given ID must be unique among all RPCs in the same Nexus.
+    /// ID and the current thread. Will operate on the specified port of the given
+    /// device. The given ID must be unique among all RPCs in the same Nexus.
     ///
     /// The created `Rpc` instance is pinned on heap to prevent moving around.
     /// Otherwise, it can invalidate pointers recorded in request handles.
@@ -639,26 +702,43 @@ impl Rpc {
         // Create the SM event channel first, so that it will immediately
         // panic if the given ID is already used.
         let sm_rx = nexus.register_event_channel(id);
+        let tp = UdTransport::new(nic, phy_port);
         Box::pin(Self {
             id,
             nexus: nexus.clone(),
+            thread_id: thread::current().id(),
+
             sm_tx: UdpSocket::bind("0.0.0.0:0").unwrap(),
             sm_rx,
+            tp_ep: tp.endpoint(),
             state: RefCell::new(RpcInterior {
                 sessions: Vec::new(),
-                allocator: Box::into_raw(Box::new(BuddyAllocator::new())),
-                tp: UdTransport::new(nic, phy_port),
+                allocator: BuddyAllocator::new(),
+                tp,
                 pending_handlers: Vec::with_capacity(PREALLOC_SIZE),
                 pending_tx: Vec::with_capacity(PREALLOC_SIZE),
             }),
             progressing: RefCell::new(()),
+            _pinned: PhantomPinned,
         })
     }
 
-    /// Return the ID of this RPC instance.
+    /// Return the ID of this `Rpc` instance.
     #[inline(always)]
     pub fn id(&self) -> RpcId {
         self.id
+    }
+
+    /// Return a reference to the `Nexus` bound to.
+    #[inline(always)]
+    pub fn nexus(&self) -> &Nexus {
+        &self.nexus
+    }
+
+    /// Return the RDMA UD QP endpoint information of this `Rpc` instance.
+    #[inline(always)]
+    pub fn datagram_endpoint(&self) -> QpEndpoint {
+        self.tp_ep
     }
 
     /// Create a client session that connects to a remote `Rpc` instance.
@@ -666,6 +746,10 @@ impl Rpc {
     /// The created session is not connected by default, and it will spend no
     /// efforts on establishing the connection until you call
     /// [`Session::connect()`](SessionHandle::connect) on it.
+    ///
+    /// The returned object does not have ownership of the session, but is purely
+    /// a handle to it. You may first remember the session ID and drop the handle.
+    /// When needed, you can acquire a new handle by calling [`Rpc::get_session()`].
     pub fn create_session(
         &self,
         remote_uri: impl ToSocketAddrs,
@@ -689,12 +773,28 @@ impl Rpc {
         // Initialize the session with remote peer information.
         // `peer` and `peer_sess_id` will be filled in when the connection is established.
         let sess_id = state.sessions.len() as SessId;
-        let mut sess = Session::new(self, SessionRole::Client);
+        let mut sess = Session::new(state, SessionRole::Client);
         sess.peer_uri = remote_uri;
         sess.peer_rpc_id = remote_rpc_id;
         state.sessions.push(sess);
 
-        SessionHandle::new(self, sess_id)
+        SessionHandle::new(self, sess_id, remote_uri, remote_rpc_id)
+    }
+
+    /// Return a handle to a session of the given ID.
+    pub fn get_session(&self, sess_id: SessId) -> Option<SessionHandle> {
+        let state = self.state.borrow();
+        if state.sessions.len() <= sess_id as usize {
+            return None;
+        }
+
+        let sess = &state.sessions[sess_id as usize];
+        Some(SessionHandle::new(
+            self,
+            sess_id,
+            sess.peer_uri,
+            sess.peer_rpc_id,
+        ))
     }
 
     /// Allocate a `MsgBuf` that can accommodate at least `len` bytes of
@@ -710,12 +810,7 @@ impl Rpc {
     /// Panic if buffer allocation fails.
     #[inline]
     pub fn alloc_msgbuf(&self, len: usize) -> MsgBuf {
-        let mut real_state = self.state.borrow_mut();
-
-        // SAFETY: validity of `allocator` ensured by constructor.
-        let allocator = Pin::new(unsafe { &mut *real_state.allocator });
-        let buf = allocator.alloc(len + mem::size_of::<PacketHeader>(), &mut real_state.tp);
-        MsgBuf::owned(buf, len)
+        self.state.borrow_mut().alloc_msgbuf(len)
     }
 
     /// Run an iteration of event loop to make progress.
@@ -750,17 +845,6 @@ impl Rpc {
 
 impl Drop for Rpc {
     fn drop(&mut self) {
-        // Cleanup raw pointers.
-        {
-            let state = self.state.borrow_mut();
-
-            // SAFETY: the allocator is built by `Box::from_raw`, now just reclaim it.
-            unsafe {
-                drop(Box::from_raw(state.allocator));
-            }
-        }
-
-        // Destroy the SM event channel.
         self.nexus.destroy_event_channel(self.id);
     }
 }

@@ -1,4 +1,7 @@
 use crate::msgbuf::MsgBuf;
+use crate::rpc::RpcInterior;
+use crate::session::SessionRole;
+use crate::transport::UdTransport;
 use crate::type_alias::*;
 
 pub(crate) struct SSlot {
@@ -16,6 +19,9 @@ pub(crate) struct SSlot {
     pub req: MsgBuf,
 
     /// Pre-allocated MsgBuf for single-packet responses.
+    /// Should accommodate the largest possible response, i.e., [`UdTransport::max_data_in_pkt()`].
+    ///
+    /// Only used by server, so for client, this is a dummy buffer.
     pub pre_resp_msgbuf: MsgBuf,
 
     /// Response MsgBuf.
@@ -32,6 +38,22 @@ pub(crate) struct SSlot {
 }
 
 impl SSlot {
+    /// Initialize a SSlot.
+    #[inline]
+    pub fn new(state: &mut RpcInterior, role: SessionRole) -> Self {
+        Self {
+            req_idx: 0,
+            req_type: 0,
+            req: MsgBuf::dummy(),
+            pre_resp_msgbuf: match role {
+                SessionRole::Client => MsgBuf::dummy(),
+                SessionRole::Server => state.alloc_msgbuf(UdTransport::max_data_in_pkt()),
+            },
+            resp: MsgBuf::dummy(),
+            finished: false,
+        }
+    }
+
     /// Return an immutable reference to the request buffer.
     #[inline(always)]
     pub fn req_buf(&self) -> &MsgBuf {

@@ -11,7 +11,7 @@ use rrddmma::rdma::qp::QpPeer;
 pub use self::handle::*;
 pub(crate) use self::sslot::*;
 use crate::msgbuf::MsgBuf;
-use crate::rpc::Rpc;
+use crate::rpc::RpcInterior;
 use crate::type_alias::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,11 @@ pub(crate) struct Session {
     /// Remote peer routing information.
     pub peer: Option<QpPeer>,
 
+    /// Connection status.
+    /// `None` indicates connection in progress, `Some(true)` indicates connected,
+    /// `Some(false)` indicates disconnected or connection refused.
+    pub connected: Option<bool>,
+
     /// Session request slots.
     ///
     /// Pinned in heap to avoid moving around, invalidating pointers.
@@ -60,15 +65,15 @@ pub(crate) struct Session {
 
 impl Session {
     /// Create a new session with empty peer information.
-    pub fn new(rpc: &Rpc, role: SessionRole) -> Self {
-        // FIXME: initialize slots.
-        let slots = array::from_fn(|_| todo!());
+    pub fn new(state: &mut RpcInterior, role: SessionRole) -> Self {
+        let slots = array::from_fn(|_| SSlot::new(state, role));
         Self {
             role,
             peer_uri: SocketAddr::from(([0, 0, 0, 0], 0)),
             peer_rpc_id: 0,
             peer_sess_id: 0,
             peer: None,
+            connected: Some(false),
             slots: Box::pin(slots),
             req_backlog: VecDeque::new(),
         }
@@ -83,6 +88,6 @@ impl Session {
     /// Return `true` if this session is connected.
     #[inline(always)]
     pub fn is_connected(&self) -> bool {
-        self.peer.is_some()
+        self.connected.unwrap_or(false)
     }
 }

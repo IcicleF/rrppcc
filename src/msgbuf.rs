@@ -29,7 +29,7 @@ impl MsgBuf {
     /// Maximum application data bytes in a single `MsgBuf`.
     pub const MAX_DATA_LEN: usize = BuddyAllocator::MAX_ALLOC_SIZE - mem::size_of::<PacketHeader>();
 
-    /// Create a new MsgBuf on owned buffer.
+    /// Create a new `MsgBuf` on owned buffer.
     #[inline]
     pub(crate) fn owned(buf: Buffer, data_len: usize) -> Self {
         assert!(data_len < Self::MAX_DATA_LEN);
@@ -52,7 +52,7 @@ impl MsgBuf {
         }
     }
 
-    /// Create a new MsgBuf on not-owned buffer.
+    /// Create a new `MsgBuf` on not-owned buffer.
     ///
     /// # Safety
     ///
@@ -64,6 +64,19 @@ impl MsgBuf {
             max_len: data_len,
             len: data_len,
             buffer: Buffer::fake(lkey),
+            _padding: [0; 8],
+        }
+    }
+
+    /// Create a placeholder `MsgBuf`.
+    /// This should only be useful when initializing `SSlot`s.
+    #[inline]
+    pub(crate) fn dummy() -> Self {
+        Self {
+            data: NonNull::dangling(),
+            max_len: 0,
+            len: 0,
+            buffer: Buffer::fake(0),
             _padding: [0; 8],
         }
     }

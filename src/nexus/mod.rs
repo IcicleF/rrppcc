@@ -16,8 +16,6 @@ use crate::msgbuf::MsgBuf;
 use crate::request::{ReqHandler, ReqHandlerFuture, Request};
 use crate::type_alias::*;
 
-static NEXUS_CREATED: AtomicBool = AtomicBool::new(false);
-
 /// Session management part of [`Nexus`].
 struct NexusSm {
     uri: SocketAddr,
@@ -104,11 +102,8 @@ impl Nexus {
     ///
     /// # Panics
     ///
-    /// - Panic if a Nexus instance has already been created and not dropped.
-    /// - Panic if the given URI cannot be resolved.
+    /// Panic if the given URI cannot be resolved.
     pub fn new(uri: impl ToSocketAddrs) -> Pin<Arc<Self>> {
-        assert!(!NEXUS_CREATED.swap(true, Ordering::SeqCst));
-
         let uri = uri
             .to_socket_addrs()
             .expect("failed to resolve remote URI")
@@ -157,7 +152,5 @@ impl Drop for Nexus {
     fn drop(&mut self) {
         self.sm.sm_should_stop.store(true, Ordering::SeqCst);
         self.sm_thread.take().unwrap().join().unwrap();
-
-        NEXUS_CREATED.store(false, Ordering::SeqCst);
     }
 }

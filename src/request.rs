@@ -22,25 +22,25 @@ pub(crate) type ReqHandler = Box<dyn Fn(Request) -> ReqHandlerFuture + Send + Sy
 /// RPC request handle.
 pub struct Request {
     /// Pointer to the `Rpc` instance that calls this handler function.
-    rpc: *const Rpc,
+    rpc: &'static Rpc,
 
     /// Pointer to the SSlot of this request.
-    sslot: *const SSlot,
+    sslot: &'static SSlot,
 }
 
 impl Request {
     /// Construct a request handle.
     #[inline(always)]
     pub(crate) fn new<'a>(rpc: &'a Rpc, sslot: &'a SSlot) -> Self {
-        Self { rpc, sslot }
-    }
-
-    /// Return a reference to the `SSlot` that holds this request.
-    #[inline(always)]
-    fn sslot(&self) -> &SSlot {
-        // SAFETY: all created `SSlot` instances are pinned in the heap, so it is
-        // safe to dereference the pointer.
-        unsafe { &*self.sslot }
+        // SAFETY: `Rpc`s and `SSlots` are unmovable on the heap, so it is
+        // safe to make these references into pointers.
+        // Also, only request handlers called by an `Rpc` will see the `Request`
+        // instance, so from the perspective of the handler, the `Rpc` and `SSlot`
+        // instances are always alive, i.e., `'static`.
+        Self {
+            rpc: unsafe { &*(rpc as *const _) },
+            sslot: unsafe { &*(sslot as *const _) },
+        }
     }
 }
 
@@ -48,21 +48,19 @@ impl Request {
     /// Return the `Rpc` instance that called this handler function.
     #[inline(always)]
     pub fn rpc(&self) -> &Rpc {
-        // SAFETY: all created `Rpc` instances are pinned in the heap, so it is
-        // safe to dereference the pointer.
-        unsafe { &*self.rpc }
+        self.rpc
     }
 
     /// Return the type of this request.
     #[inline(always)]
     pub fn req_type(&self) -> ReqType {
-        self.sslot().req_type
+        self.sslot.req_type
     }
 
     /// Return the request buffer.
     #[inline(always)]
     pub fn req_buf(&self) -> &MsgBuf {
-        self.sslot().req_buf()
+        self.sslot.req_buf()
     }
 
     /// Return the prepared response buffer.
@@ -71,6 +69,6 @@ impl Request {
     /// need larger responses, you should use `Rpc::alloc_msgbuf()`.
     #[inline(always)]
     pub fn resp_buf(&self) -> MsgBuf {
-        self.sslot().pre_resp_msgbuf.clone_borrowed()
+        self.sslot.pre_resp_msgbuf.clone_borrowed()
     }
 }
