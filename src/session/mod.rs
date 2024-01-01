@@ -20,15 +20,15 @@ pub(crate) enum SessionRole {
     Server,
 }
 
-struct PendingRequest {
-    /// Request type.
-    req_type: ReqType,
-
+pub(crate) struct PendingRequest {
     /// Request MsgBuf.
-    req_msgbuf: *mut MsgBuf,
+    pub req: MsgBuf,
 
     /// Response MsgBuf.
-    resp_msgbuf: *mut MsgBuf,
+    pub resp: MsgBuf,
+
+    /// Expected request index, only for correctness check.
+    pub expected_req_idx: ReqIdx,
 }
 
 pub(crate) const ACTIVE_REQ_WINDOW: usize = 8;
@@ -36,46 +36,56 @@ pub(crate) const ACTIVE_REQ_WINDOW: usize = 8;
 pub(crate) struct Session {
     /// Role of this session.
     role: SessionRole,
-
-    /// Remote peer's Nexus URI.
-    pub peer_uri: SocketAddr,
-
-    /// Remote peer's Rpc ID.
-    pub peer_rpc_id: RpcId,
-
-    /// Remote peer's session ID.
-    pub peer_sess_id: SessId,
-
-    /// Remote peer routing information.
-    pub peer: Option<QpPeer>,
-
     /// Connection status.
     /// `None` indicates connection in progress, `Some(true)` indicates connected,
     /// `Some(false)` indicates disconnected or connection refused.
     pub connected: Option<bool>,
 
+    /// Remote peer's Nexus URI.
+    pub peer_uri: SocketAddr,
+    /// Remote peer's Rpc ID.
+    pub peer_rpc_id: RpcId,
+    /// Remote peer's session ID.
+    pub peer_sess_id: SessId,
+    /// Remote peer routing information.
+    pub peer: Option<QpPeer>,
+
     /// Session request slots.
     ///
     /// Pinned in heap to avoid moving around, invalidating pointers.
     pub slots: Pin<Box<[SSlot; ACTIVE_REQ_WINDOW]>>,
-
+    /// Available SSlot index list.
+    pub avail_slots: VecDeque<usize>,
     /// Queue for requests that are waiting for credits.
-    req_backlog: VecDeque<PendingRequest>,
+    ///
+    /// FIXME: the [`Request`] type records the `SSlot` index, which requires the
+    /// `SSlot` of a request to be determined immediately. However, for requests
+    /// in the backlog queue, the `SSlot` is not determined until the request is
+    /// dequeued. Therefore, we must maintain a separate queue for each SSlot.
+    /// This wastes memory and possibly reduces performance.
+    pub req_backlog: [VecDeque<PendingRequest>; ACTIVE_REQ_WINDOW],
 }
 
 impl Session {
     /// Create a new session with empty peer information.
     pub fn new(state: &mut RpcInterior, role: SessionRole) -> Self {
-        let slots = array::from_fn(|_| SSlot::new(state, role));
+        let initial_psn_base = match role {
+            SessionRole::Client => ACTIVE_REQ_WINDOW,
+            SessionRole::Server => 0,
+        };
+        let slots = array::from_fn(|i| SSlot::new(state, role, (i + initial_psn_base) as _));
         Self {
             role,
+            connected: Some(false),
+
             peer_uri: SocketAddr::from(([0, 0, 0, 0], 0)),
             peer_rpc_id: 0,
             peer_sess_id: 0,
             peer: None,
-            connected: Some(false),
+
             slots: Box::pin(slots),
-            req_backlog: VecDeque::new(),
+            avail_slots: (0..ACTIVE_REQ_WINDOW).collect(),
+            req_backlog: array::from_fn(|_| VecDeque::new()),
         }
     }
 

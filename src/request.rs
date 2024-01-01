@@ -1,74 +1,96 @@
+//! Define `Request`, an awaitable object that resolves to an RPC response.
+
 use std::future::Future;
 use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use quanta::Instant;
 
 use crate::msgbuf::MsgBuf;
 use crate::rpc::Rpc;
-use crate::session::SSlot;
 use crate::type_alias::*;
+use crate::util::thread_check::do_thread_check;
 
-/// RPC request handler function return type.
-pub(crate) type ReqHandlerFuture = Pin<Box<dyn Future<Output = MsgBuf> + Send + Sync + 'static>>;
-
-/// RPC request handler function trait.
+/// An awaitable object that represents an incompleted RPC request.
 ///
-/// Every handler function take two parameters.
-/// The first is a [`Pin<&Rpc>`], which refers to the [`Rpc`] instance that calls
-/// this handler function due to a client RPC request.
-/// The second is a  [`ReqHandle`] that contains pointers to.
-/// The handler should` ` return a future that resolves to the length of the response.
-/// The response should be filled in the buffer pointed by `resp_buf`.
-pub(crate) type ReqHandler = Box<dyn Fn(Request) -> ReqHandlerFuture + Send + Sync + 'static>;
+/// Resolves to nothing when the request is completed.
+/// The user should find the response in the buffer they provided when sending the request.
+pub struct Request<'a> {
+    /// Pointer to the `Rpc` instance that this request belongs to.
+    rpc: &'a Rpc,
 
-/// RPC request handle.
-pub struct Request {
-    /// Pointer to the `Rpc` instance that calls this handler function.
-    rpc: &'static Rpc,
+    /// Pointer to the `MsgBuf` that the user designated for the response.
+    resp_buf: &'a mut MsgBuf,
 
-    /// Pointer to the SSlot of this request.
-    sslot: &'static SSlot,
+    /// Session ID.
+    sess_id: SessId,
+
+    /// SSlot index.
+    sslot_idx: usize,
+
+    /// Request index.
+    req_idx: ReqIdx,
+
+    /// Request start time.
+    start_time: Instant,
+
+    /// Indicates whether this request has been aborted.
+    /// If `true`, polling this request will always return `Poll::Pending`.
+    aborted: bool,
 }
 
-impl Request {
-    /// Construct a request handle.
+impl<'a> Request<'a> {
+    /// Create a new request.
     #[inline(always)]
-    pub(crate) fn new<'a>(rpc: &'a Rpc, sslot: &'a SSlot) -> Self {
-        // SAFETY: `Rpc`s and `SSlots` are unmovable on the heap, so it is
-        // safe to make these references into pointers.
-        // Also, only request handlers called by an `Rpc` will see the `Request`
-        // instance, so from the perspective of the handler, the `Rpc` and `SSlot`
-        // instances are always alive, i.e., `'static`.
+    pub(crate) fn new(
+        rpc: &'a Rpc,
+        resp_buf: &'a mut MsgBuf,
+        sess_id: SessId,
+        sslot_idx: usize,
+        req_idx: ReqIdx,
+    ) -> Self {
         Self {
-            rpc: unsafe { &*(rpc as *const _) },
-            sslot: unsafe { &*(sslot as *const _) },
+            rpc,
+            resp_buf,
+            sess_id,
+            sslot_idx,
+            req_idx,
+            start_time: Instant::now(),
+            aborted: false,
         }
     }
 }
 
-impl Request {
-    /// Return the `Rpc` instance that called this handler function.
-    #[inline(always)]
-    pub fn rpc(&self) -> &Rpc {
-        self.rpc
-    }
+impl Request<'_> {
+    /// Retransmit the request if the response is not received within 20ms.
+    pub const RETX_TIMEOUT: Duration = Duration::from_millis(20);
+}
 
-    /// Return the type of this request.
-    #[inline(always)]
-    pub fn req_type(&self) -> ReqType {
-        self.sslot.req_type
-    }
+impl<'a> Future for Request<'a> {
+    type Output = ();
 
-    /// Return the request buffer.
-    #[inline(always)]
-    pub fn req_buf(&self) -> &MsgBuf {
-        self.sslot.req_buf()
-    }
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        do_thread_check(self.rpc);
 
-    /// Return the prepared response buffer.
-    ///
-    /// This buffer can only accommodate MTU-sized data (usually 4KiB). If you
-    /// need larger responses, you should use `Rpc::alloc_msgbuf()`.
-    #[inline(always)]
-    pub fn resp_buf(&self) -> MsgBuf {
-        self.sslot.pre_resp_msgbuf.clone_borrowed()
+        // If the request has been aborted, always return `Poll::Pending`.
+        if self.aborted {
+            return Poll::Pending;
+        }
+
+        // If the request has finished, return the response.
+        let need_re_tx = self.start_time.elapsed() > Self::RETX_TIMEOUT;
+        if self.rpc.check_request_completion(
+            (self.sess_id, self.sslot_idx, self.req_idx),
+            self.resp_buf,
+            need_re_tx,
+        ) {
+            return Poll::Ready(());
+        }
+
+        // Otherwise, try to make some progress.
+        self.rpc.progress();
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }

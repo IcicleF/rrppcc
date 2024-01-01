@@ -3,7 +3,6 @@ mod event;
 use std::future::Future;
 use std::io::ErrorKind as IoErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::pin::Pin;
 use std::sync::{atomic::*, Arc};
 use std::{array, thread, time};
 
@@ -12,8 +11,8 @@ use dashmap::DashMap;
 use rmp_serde as rmps;
 
 pub(crate) use self::event::*;
+use crate::handler::{ReqHandler, ReqHandlerFuture, RequestHandle};
 use crate::msgbuf::MsgBuf;
-use crate::request::{ReqHandler, ReqHandlerFuture, Request};
 use crate::type_alias::*;
 
 /// Session management part of [`Nexus`].
@@ -90,7 +89,7 @@ impl Nexus {
     ///
     /// Panic if there is no such request handler.
     #[inline]
-    pub(crate) fn call_rpc_handler(&self, req: Request) -> ReqHandlerFuture {
+    pub(crate) fn call_rpc_handler(&self, req: RequestHandle) -> ReqHandlerFuture {
         let req_type = req.req_type();
         let handler = self.rpc_handlers[req_type as usize].as_ref().unwrap();
         handler(req)
@@ -103,7 +102,7 @@ impl Nexus {
     /// # Panics
     ///
     /// Panic if the given URI cannot be resolved.
-    pub fn new(uri: impl ToSocketAddrs) -> Pin<Arc<Self>> {
+    pub fn new(uri: impl ToSocketAddrs) -> Arc<Self> {
         let uri = uri
             .to_socket_addrs()
             .expect("failed to resolve remote URI")
@@ -124,7 +123,7 @@ impl Nexus {
             let sm = sm.clone();
             thread::spawn(move || sm.listen(socket))
         };
-        Arc::pin(Self {
+        Arc::new(Self {
             rpc_handlers: array::from_fn(|_| None),
             sm,
             sm_thread: Some(sm_listener),
@@ -138,13 +137,19 @@ impl Nexus {
     }
 
     /// Set the handler for the given request type.
-    pub fn set_rpc_handler<H, F>(&mut self, req_id: ReqType, handler: H) -> &mut Self
+    /// This must be done before any [`Rpc`](`crate::Rpc`)s are created on this `Nexus`.
+    ///
+    /// # Panics
+    ///
+    /// Panic if there is already an `Rpc` created.
+    pub fn set_rpc_handler<H, F>(self: &mut Arc<Self>, req_id: ReqType, handler: H)
     where
-        H: Fn(Request) -> F + Send + Sync + 'static,
+        H: Fn(RequestHandle) -> F + Send + Sync + 'static,
         F: Future<Output = MsgBuf> + Send + Sync + 'static,
     {
-        self.rpc_handlers[req_id as usize] = Some(Box::new(move |req| Box::pin(handler(req))));
-        self
+        let this =
+            Arc::get_mut(self).expect("cannot set request handlers after `Rpc`s are created");
+        this.rpc_handlers[req_id as usize] = Some(Box::new(move |req| Box::pin(handler(req))));
     }
 }
 

@@ -75,7 +75,7 @@ impl UdTransport {
     const MTU: usize = 1 << 12;
     const MAX_PKT_SIZE: usize = Self::MTU - mem::size_of::<PacketHeader>();
 
-    const SQ_SIZE: usize = 1 << 7;
+    const SQ_SIZE: usize = 1 << 8;
     const SQ_SIGNAL_BATCH: usize = 1 << 6;
 
     const RQ_SIZE: usize = 1 << 12;
@@ -138,7 +138,7 @@ impl UdTransport {
                 .send_cq(&send_cq)
                 .recv_cq(&recv_cq)
                 .caps(QpCaps {
-                    max_send_wr: Self::SQ_SIGNAL_BATCH as _,
+                    max_send_wr: Self::SQ_SIZE as _,
                     max_recv_wr: Self::RQ_SIZE as _,
                     max_send_sge: 1,
                     max_recv_sge: 1,
@@ -320,7 +320,7 @@ impl UdTransport {
 
             // Fill in the scatter/gather list.
             let msgbuf = &*item.msgbuf;
-            let length = msgbuf.len() as _;
+            let length = msgbuf.pkt_len() as _;
             *sge = ibv_sge {
                 addr: msgbuf.pkt_hdr() as _,
                 length,
@@ -414,10 +414,14 @@ impl UdTransport {
     /// - Only `MsgBuf` returned by `rx_next` can be released.
     /// - Every `MsgBuf` must not be used after it is released.
     /// - Every `MsgBuf` must not be released more than once.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn rx_release(&mut self, item: &MsgBuf) {
-        self.rx_sge[self.rx_repost_pending].addr = item.pkt_hdr() as _;
-        self.rx_wr[self.rx_repost_pending].wr_id = item.lkey() as _;
+        let i = self.rx_repost_pending;
+
+        // SAFETY: in the same allocated buffer.
+        self.rx_sge[i].addr =
+            unsafe { self.rx_buf.ptr.add(Self::rx_offset(item.lkey() as _) as _) } as _;
+        self.rx_wr[i].wr_id = item.lkey() as _;
         self.rx_repost_pending += 1;
 
         if unlikely(self.rx_repost_pending == Self::RQ_POSTLIST_SIZE) {

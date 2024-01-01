@@ -57,12 +57,6 @@ impl Buffer {
     pub fn lkey(&self) -> LKey {
         self.lkey
     }
-
-    /// Return `true` if this buffer is fake.
-    #[inline(always)]
-    pub fn is_fake(&self) -> bool {
-        self.owner.is_null()
-    }
 }
 
 impl Drop for Buffer {

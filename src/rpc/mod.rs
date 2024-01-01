@@ -19,8 +19,9 @@ use rmp_serde as rmps;
 use rrddmma::rdma::qp::QpEndpoint;
 
 use self::pending::*;
+use crate::type_alias::*;
 use crate::util::{buddy::*, likely::*};
-use crate::{msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*, type_alias::*};
+use crate::{handler::*, msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*};
 
 /// Interior-mutable state of an [`Rpc`] instance.
 pub(crate) struct RpcInterior {
@@ -78,7 +79,7 @@ pub struct Rpc {
     /// ID of this RPC instance.
     id: RpcId,
     /// Nexus this RPC is bound to.
-    nexus: Pin<Arc<Nexus>>,
+    nexus: Arc<Nexus>,
     /// The thread ID of the thread that created this RPC instance.
     pub(crate) thread_id: ThreadId,
 
@@ -205,7 +206,7 @@ impl Rpc {
         sslot.req = req_msgbuf.clone_borrowed();
 
         // Construct the request. This will fetch the raw pointer of the current `Rpc` and `sslot`.
-        let request = Request::new(self, sslot);
+        let request = RequestHandle::new(self, sslot);
         drop(real_state);
 
         // Call the request handler with no `state` borrows.
@@ -288,16 +289,15 @@ impl Rpc {
         let sslot = &mut sess.slots[sslot_idx];
 
         // Check packet metadata sanity.
-        if unlikely(hdr.req_type() != sslot.req_type || hdr.req_idx() != sslot.req_idx) {
+        if unlikely(hdr.req_idx() != sslot.req_idx) {
             assert!(
                 hdr.req_idx() < sslot.req_idx,
                 "response for future request is impossible"
             );
             log::debug!(
-                "RPC {}: dropping received SmallResponse for expired request (idx {}, ty {})",
+                "RPC {}: dropping received SmallResponse for expired request (idx {})",
                 self.id,
-                hdr.req_idx(),
-                hdr.req_type()
+                hdr.req_idx()
             );
             return;
         }
@@ -453,6 +453,9 @@ impl Rpc {
 
         // Do RX burst.
         let n = state.tp.rx_burst();
+        if n == 0 {
+            return;
+        }
 
         // Process the received packets.
         let mut rx_bufs_to_release = Vec::with_capacity(n);
@@ -468,12 +471,13 @@ impl Rpc {
             // SAFETY: guaranteed not null and aligned.
             let hdr = unsafe { NonNull::new_unchecked(item.pkt_hdr()).as_mut() };
             let sess_id = hdr.dst_sess_id();
-            if unlikely(state.sessions.len() as u32 <= sess_id) {
+            if unlikely(state.sessions.len() <= sess_id as usize) {
                 log::debug!(
                     "RPC {}: dropping received data-plane packet for non-existent session {}",
                     self.id,
                     sess_id
                 );
+                continue;
             }
 
             // Perform session sanity check.
@@ -484,6 +488,7 @@ impl Rpc {
                     self.id,
                     sess_id
                 );
+                continue;
             }
             match hdr.pkt_type() {
                 PktType::SmallReq | PktType::LargeReqCtrl => {
@@ -670,6 +675,7 @@ impl Rpc {
     ///
     /// - Panic if the session ID is invalid.
     /// - Panic if the session is already connected.
+    /// - Panic if called when `self.state` is already borrowed.
     #[inline]
     pub(crate) fn mark_session_connecting(&self, sess_id: SessId) {
         let mut real_state = self.state.borrow_mut();
@@ -680,6 +686,178 @@ impl Rpc {
             panic!("session {} is already connected", sess_id);
         }
         sess.connected = None;
+    }
+
+    /// Enqueue a request for a session.
+    /// Return the `SSlot` index assigned to this request.
+    ///
+    /// # Panics
+    ///
+    /// - Panic if the session ID is invalid.
+    /// - Panic if called when `self.state` is already borrowed.
+    pub(crate) fn enqueue_request<'a>(
+        &'a self,
+        sess_id: SessId,
+        req_type: ReqType,
+        req_msgbuf: &'a MsgBuf,
+        resp_msgbuf: &'a mut MsgBuf,
+    ) -> Request<'a> {
+        let mut real_state = self.state.borrow_mut();
+        let state: &mut RpcInterior = &mut real_state;
+
+        let sess = &mut state.sessions[sess_id as usize];
+
+        // Fetch an available slot, enqueue to the shortest queue if failing.
+        if let Some(sslot_idx) = sess.avail_slots.pop_front() {
+            // Fill in SSlot entries.
+            let sslot = &mut sess.slots[sslot_idx];
+            sslot.finished = false;
+            sslot.req = req_msgbuf.clone_borrowed();
+            sslot.resp = resp_msgbuf.clone_borrowed();
+
+            // Fill in the packet header.
+            // SAFETY: the destination buffer is guaranteed to be valid.
+            unsafe {
+                ptr::write(
+                    req_msgbuf.pkt_hdr(),
+                    PacketHeader::new(
+                        req_type,
+                        req_msgbuf.len() as _,
+                        sess.peer_sess_id,
+                        sslot.req_idx,
+                        PktType::SmallReq,
+                    ),
+                )
+            };
+
+            // Push the request into the Tx queue.
+            state.pending_tx.push(TxItem {
+                peer: sess.peer.as_ref().unwrap(),
+                msgbuf: &sslot.req,
+            });
+
+            Request::new(self, resp_msgbuf, sess_id, sslot_idx, sslot.req_idx)
+        } else {
+            let (sslot_idx, pending_len) = sess
+                .req_backlog
+                .iter()
+                .enumerate()
+                .map(|(i, queue)| (i, queue.len()))
+                .min_by_key(|(_, len)| *len)
+                .unwrap();
+
+            // Invariant: if there are pending requests, then the SSlot must be non-empty.
+            // So, request index is current index + backlog length * ACTIVE_REQ_WINDOW.
+            let req_idx =
+                sess.slots[sslot_idx].req_idx + (pending_len * ACTIVE_REQ_WINDOW) as ReqIdx;
+
+            // Fill in the packet header.
+            // SAFETY: the destination buffer is guaranteed to be valid.
+            unsafe {
+                ptr::write(
+                    req_msgbuf.pkt_hdr(),
+                    PacketHeader::new(
+                        req_type,
+                        req_msgbuf.len() as _,
+                        sess.peer_sess_id,
+                        req_idx,
+                        PktType::SmallReq,
+                    ),
+                )
+            };
+
+            // Push the request into the pending queue.
+            sess.req_backlog[sslot_idx].push_back(PendingRequest {
+                req: req_msgbuf.clone_borrowed(),
+                resp: resp_msgbuf.clone_borrowed(),
+                expected_req_idx: req_idx,
+            });
+
+            Request::new(self, resp_msgbuf, sess_id, sslot_idx, req_idx)
+        }
+    }
+
+    /// Check and handle the completion status of a request.
+    ///
+    /// Upon completion, modify the passed-in response buffer to the correct size.
+    /// Also, update the `SSlot` to mark the current request as outdated.
+    /// If there is a waiting request, make it active.
+    /// Otherwise, if the request is unfinished and the caller asks for retransmission,
+    /// add the retransmission item to the pending Tx queue.
+    ///
+    /// For now, we use this function to finalize a request, instead of doing so in
+    /// [`Self::process_rx()`]. Possibly fix this in the future.
+    ///
+    /// # Panics
+    ///
+    /// - Panic if the session ID or SSlot index is invalid.
+    /// - Panic if called when `self.state` is already borrowed.
+    pub(crate) fn check_request_completion(
+        &self,
+        (sess_id, sslot_idx, req_idx): (SessId, usize, ReqIdx),
+        resp_buf: &mut MsgBuf,
+        re_tx: bool,
+    ) -> bool {
+        let mut real_state = self.state.borrow_mut();
+        let state: &mut RpcInterior = &mut real_state;
+
+        let sess = &mut state.sessions[sess_id as usize];
+        let sslot = &mut sess.slots[sslot_idx];
+
+        assert!(
+            sslot.req_idx >= req_idx,
+            "sslot {} req_idx {} > request req_idx {}, this shouldn't happen!",
+            sslot_idx,
+            sslot.req_idx,
+            req_idx
+        );
+
+        // Request has already expired, so it must be finished.
+        // Would this really happen?
+        if unlikely(sslot.req_idx > req_idx) {
+            return true;
+        }
+
+        // Now we must have `sslot.req_idx == req_idx`.
+        if sslot.finished {
+            resp_buf.set_len(sslot.resp.len());
+            sslot.req_idx += ACTIVE_REQ_WINDOW as ReqIdx;
+
+            // Make a pending request active, if there is any.
+            if let Some(pending_req) = sess.req_backlog[sslot_idx].pop_front() {
+                // Reuse the same SSlot.
+                assert!(
+                    pending_req.expected_req_idx == sslot.req_idx,
+                    "mismatch req_idx for pending request: expected {}, got {}",
+                    pending_req.expected_req_idx,
+                    sslot.req_idx
+                );
+                sslot.finished = false;
+                sslot.req = pending_req.req;
+                sslot.resp = pending_req.resp;
+
+                // Packet header should have been prepared when enqueueing the request,
+                // so just push the packet into the Tx queue.
+                state.pending_tx.push(TxItem {
+                    peer: sess.peer.as_ref().unwrap(),
+                    msgbuf: &sslot.req,
+                });
+            } else {
+                // Free the SSlot.
+                sess.avail_slots.push_back(sslot_idx);
+            }
+
+            return true;
+        }
+
+        // Not finished, handle retransmission.
+        if unlikely(re_tx) {
+            state.pending_tx.push(TxItem {
+                peer: sess.peer.as_ref().unwrap(),
+                msgbuf: &sslot.resp,
+            });
+        }
+        false
     }
 }
 
@@ -696,7 +874,7 @@ impl Rpc {
     ///
     /// - Panic if the given ID is already used.
     /// - Panic if there is no such device or no such port.
-    pub fn new(nexus: &Pin<Arc<Nexus>>, id: RpcId, nic: &str, phy_port: u8) -> Pin<Box<Self>> {
+    pub fn new(nexus: &Arc<Nexus>, id: RpcId, nic: &str, phy_port: u8) -> Pin<Box<Self>> {
         const PREALLOC_SIZE: usize = 64;
 
         // Create the SM event channel first, so that it will immediately

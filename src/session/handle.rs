@@ -5,7 +5,9 @@ use std::task::{Context, Poll};
 
 use rmp_serde as rmps;
 
+use crate::msgbuf::MsgBuf;
 use crate::nexus::{SmEvent, SmEventDetails};
+use crate::request::Request;
 use crate::rpc::Rpc;
 use crate::type_alias::*;
 use crate::util::{likely::*, thread_check::*};
@@ -99,6 +101,25 @@ impl<'r> SessionHandle<'r> {
             sess_id: self.sess_id,
         }
     }
+
+    /// Send a request in this session.
+    ///
+    /// When the return value is resolved, the response buffer will also be resized
+    /// to the proper length. Note that truncation may occur if the response buffer
+    /// is too small, and there will not be any warning.
+    pub fn request<'a>(
+        &'a self,
+        req_type: ReqType,
+        req_msgbuf: &'a MsgBuf,
+        resp_msgbuf: &'a mut MsgBuf,
+    ) -> Request<'a>
+    where
+        'r: 'a,
+    {
+        do_thread_check(self.rpc);
+        self.rpc
+            .enqueue_request(self.sess_id, req_type, req_msgbuf, resp_msgbuf)
+    }
 }
 
 /// Session connection awaitable.
@@ -115,6 +136,8 @@ impl Future for SessionConnect<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         do_thread_check(self.rpc);
+
+        // Check if the session connection state has already been determined.
         if let Some(result) = self.rpc.session_connection_state(self.sess_id) {
             Poll::Ready(result)
         } else {

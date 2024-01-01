@@ -81,14 +81,10 @@ impl MsgBuf {
         }
     }
 
-    /// Clone a borrowed `MsgBuf`.
-    ///
-    /// # Panics
-    ///
-    /// Panic (in debug mode) if the `MsgBuf` is not borrowed.
+    /// Clone a `MsgBuf` as borrowed.
+    /// The resulting `MsgBuf` will not do anything when dropped.
     #[inline]
     pub(crate) fn clone_borrowed(&self) -> Self {
-        debug_assert!(self.buffer.is_fake(), "attempting to clone a owned MsgBuf");
         Self {
             data: self.data,
             max_len: self.max_len,
@@ -115,6 +111,13 @@ impl MsgBuf {
     #[inline(always)]
     pub(crate) fn lkey(&self) -> LKey {
         self.buffer.lkey()
+    }
+
+    /// Get the length of the entire packet (containing the header).
+    /// This is the length that should be used when sending the packet.
+    #[inline(always)]
+    pub(crate) fn pkt_len(&self) -> usize {
+        self.len + mem::size_of::<PacketHeader>()
     }
 }
 

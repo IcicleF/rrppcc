@@ -2,8 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::handler::ReqHandlerFuture;
 use crate::msgbuf::MsgBuf;
-use crate::request::ReqHandlerFuture;
 use crate::type_alias::*;
 
 /// Pending RPC request handler.

@@ -9,6 +9,7 @@ pub(crate) struct SSlot {
     pub req_idx: ReqIdx,
 
     /// Current request type.
+    /// Only used by server, so for client, this is always zero.
     pub req_type: ReqType,
 
     /// Request MsgBuf.
@@ -40,9 +41,9 @@ pub(crate) struct SSlot {
 impl SSlot {
     /// Initialize a SSlot.
     #[inline]
-    pub fn new(state: &mut RpcInterior, role: SessionRole) -> Self {
+    pub fn new(state: &mut RpcInterior, role: SessionRole, idx: ReqIdx) -> Self {
         Self {
-            req_idx: 0,
+            req_idx: idx,
             req_type: 0,
             req: MsgBuf::dummy(),
             pre_resp_msgbuf: match role {
