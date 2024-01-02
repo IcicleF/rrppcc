@@ -1,5 +1,3 @@
 # rrppcc
 
-> A userspace high-performance RPC library in Rust.
-
-WIP
+> An unsound userspace high-performance RPC library in Rust.

@@ -1,6 +1,6 @@
 [package]
 name = "rrppcc"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "A high-performance userspace RDMA RPC engine."
@@ -11,7 +11,7 @@ repository = "https://github.com/IcicleF/rrppcc"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rrddmma = { path = "../rrddmma" }
+rrddmma = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 rmp-serde = "1.1"
 bitvec = "1.0"
