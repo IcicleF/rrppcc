@@ -7,6 +7,7 @@ use crate::msgbuf::MsgBuf;
 use crate::rpc::Rpc;
 use crate::session::SSlot;
 use crate::type_alias::*;
+use crate::util::thread_check::do_thread_check;
 
 /// RPC request handler function return type.
 pub(crate) type ReqHandlerFuture = Pin<Box<dyn Future<Output = MsgBuf> + Send + Sync + 'static>>;
@@ -50,18 +51,21 @@ impl RequestHandle {
     /// Return the `Rpc` instance that called this handler function.
     #[inline(always)]
     pub fn rpc(&self) -> &Rpc {
+        do_thread_check(self.rpc);
         self.rpc
     }
 
     /// Return the type of this request.
     #[inline(always)]
     pub fn req_type(&self) -> ReqType {
+        do_thread_check(self.rpc);
         self.sslot.req_type
     }
 
     /// Return the request buffer.
     #[inline(always)]
     pub fn req_buf(&self) -> &MsgBuf {
+        do_thread_check(self.rpc);
         self.sslot.req_buf()
     }
 
@@ -71,6 +75,7 @@ impl RequestHandle {
     /// need larger responses, you should use `Rpc::alloc_msgbuf()`.
     #[inline(always)]
     pub fn pre_resp_buf(&self) -> MsgBuf {
+        do_thread_check(self.rpc);
         self.sslot.pre_resp_msgbuf.clone_borrowed()
     }
 }

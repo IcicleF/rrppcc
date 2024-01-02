@@ -4,10 +4,12 @@ use std::future::Future;
 use std::io::ErrorKind as IoErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{atomic::*, Arc};
-use std::{array, thread, time};
+use std::time::Duration;
+use std::{array, thread};
 
 use ahash::RandomState;
 use dashmap::DashMap;
+use quanta::Upkeep;
 use rmp_serde as rmps;
 
 pub(crate) use self::event::*;
@@ -58,6 +60,7 @@ pub struct Nexus {
 
     sm: Arc<NexusSm>,
     sm_thread: Option<thread::JoinHandle<()>>,
+    _upkeeper: Option<quanta::Handle>,
 }
 
 impl Nexus {
@@ -99,9 +102,13 @@ impl Nexus {
 impl Nexus {
     /// Create a new Nexus instance.
     ///
+    /// This also creates a [`quanta::Upkeep`] thread if there aren't any existing.
+    /// `Rpc`s rely on the upkeeper to provide ms-precision time for packet loss detection.
+    ///
     /// # Panics
     ///
-    /// Panic if the given URI cannot be resolved.
+    /// - Panic if the given URI cannot be resolved.
+    /// - Panic if the upkeep thread cannot be spawned.
     pub fn new(uri: impl ToSocketAddrs) -> Arc<Self> {
         let uri = uri
             .to_socket_addrs()
@@ -110,7 +117,7 @@ impl Nexus {
             .expect("no such remote URI");
         let socket = UdpSocket::bind(uri).unwrap();
 
-        const SOCKET_READ_TIMEOUT: time::Duration = time::Duration::from_millis(100);
+        const SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(100);
         socket.set_read_timeout(Some(SOCKET_READ_TIMEOUT)).unwrap();
 
         // Make the session manager.
@@ -123,10 +130,23 @@ impl Nexus {
             let sm = sm.clone();
             thread::spawn(move || sm.listen(socket))
         };
+
+        // Run a quanta upkeep thread that provides ms-precision time
+        // for packet loss detection. This can fail due to an existing
+        // upkeep thread, but failing to spawn the upkeep thread is
+        // not tolerable.
+        const UPKEEP_INTERVAL: Duration = Duration::from_millis(1);
+        let upkeeper = Upkeep::new(UPKEEP_INTERVAL).start();
+
+        if let Err(quanta::Error::FailedToSpawnUpkeepThread(ref e)) = upkeeper {
+            panic!("failed to spawn clock upkeep thread: {}", e);
+        }
+
         Arc::new(Self {
             rpc_handlers: array::from_fn(|_| None),
             sm,
             sm_thread: Some(sm_listener),
+            _upkeeper: upkeeper.ok(),
         })
     }
 

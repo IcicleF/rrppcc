@@ -40,6 +40,9 @@ pub struct Request<'a> {
     aborted: bool,
 }
 
+unsafe impl Send for Request<'_> {}
+unsafe impl Sync for Request<'_> {}
+
 impl<'a> Request<'a> {
     /// Create a new request.
     #[inline(always)]
@@ -56,7 +59,7 @@ impl<'a> Request<'a> {
             sess_id,
             sslot_idx,
             req_idx,
-            start_time: Instant::now(),
+            start_time: Instant::recent(),
             aborted: false,
         }
     }
@@ -79,7 +82,7 @@ impl<'a> Future for Request<'a> {
         }
 
         // If the request has finished, return the response.
-        let need_re_tx = self.start_time.elapsed() > Self::RETX_TIMEOUT;
+        let need_re_tx = Instant::recent() - self.start_time > Self::RETX_TIMEOUT;
         if self.rpc.check_request_completion(
             (self.sess_id, self.sslot_idx, self.req_idx),
             self.resp_buf,

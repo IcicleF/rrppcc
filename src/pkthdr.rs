@@ -162,7 +162,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pkthdr_layout() {
-        assert_eq!(mem::size_of::<PacketHeader>(), 16);
+    fn header_layout() {
+        assert_eq!(mem::size_of::<PacketHeader>(), 16); 
+        assert_eq!(mem::align_of::<PacketHeader>(), 8);
     }
 }

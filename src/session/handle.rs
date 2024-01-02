@@ -26,6 +26,9 @@ pub struct SessionHandle<'r> {
     remote_rpc_id: RpcId,
 }
 
+unsafe impl Send for SessionHandle<'_> {}
+unsafe impl Sync for SessionHandle<'_> {}
+
 impl<'r> SessionHandle<'r> {
     /// Create a new session handle.
     #[inline(always)]
@@ -147,3 +150,6 @@ impl Future for SessionConnect<'_> {
         }
     }
 }
+
+unsafe impl Send for SessionConnect<'_> {}
+unsafe impl Sync for SessionConnect<'_> {}

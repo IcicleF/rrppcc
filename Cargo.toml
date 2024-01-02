@@ -29,8 +29,13 @@ quanta = "0.12"
 [dev-dependencies]
 simple_logger = { version = "4.2.0", features = ["threads"] }
 tokio = { version = "1", features = ["full"] }
+criterion = "0.5"
 
 [features]
 default = ["infiniband"]
 infiniband = []
 skip_safety_checks = []
+
+[[bench]]
+name = "synchronous"
+harness = false

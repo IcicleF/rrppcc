@@ -23,6 +23,12 @@ use crate::type_alias::*;
 use crate::util::{buddy::*, likely::*};
 use crate::{handler::*, msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*};
 
+#[cfg(debug_assertions)]
+use std::cell::RefCell as InteriorCell;
+
+#[cfg(not(debug_assertions))]
+use crate::util::unsafe_refcell::UnsafeRefCell as InteriorCell;
+
 /// Interior-mutable state of an [`Rpc`] instance.
 pub(crate) struct RpcInterior {
     /// Sessions.
@@ -93,7 +99,9 @@ pub struct Rpc {
     tp_ep: QpEndpoint,
 
     /// Interior-mutable state of this RPC.
-    state: RefCell<RpcInterior>,
+    /// Depending on the build mode, this field is either the checked [`RefCell`]
+    /// or the unchecked [`UnsafeCell`](std::cell::UnsafeCell) with some wrappings.
+    state: InteriorCell<RpcInterior>,
 
     /// A flag indicating whether this RPC is progressing.
     ///
@@ -886,7 +894,7 @@ impl Rpc {
             sm_tx: UdpSocket::bind("0.0.0.0:0").unwrap(),
             sm_rx,
             tp_ep: tp.endpoint(),
-            state: RefCell::new(RpcInterior {
+            state: InteriorCell::new(RpcInterior {
                 sessions: Vec::new(),
                 allocator: BuddyAllocator::new(),
                 tp,
