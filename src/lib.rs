@@ -11,6 +11,7 @@ mod transport;
 pub mod type_alias;
 mod util;
 
+pub use self::msgbuf::MsgBuf;
 pub use self::nexus::Nexus;
 pub use self::request::Request;
 pub use self::rpc::Rpc;

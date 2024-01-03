@@ -5,6 +5,8 @@ use crate::pkthdr::*;
 use crate::transport::LKey;
 use crate::util::{buddy::BuddyAllocator, buffer::*};
 
+/// Message buffer that can contain application data for
+/// requests or accommodate responses.
 pub struct MsgBuf {
     /// Pointer to the first *application data* byte.
     data: NonNull<u8>,

@@ -1,3 +1,3 @@
 # rrppcc
 
-> An unsound userspace high-performance RPC library in Rust.
+> An unsound RDMA RPC library in Rust.

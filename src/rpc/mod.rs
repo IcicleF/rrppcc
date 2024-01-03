@@ -76,11 +76,6 @@ impl RpcInterior {
 }
 
 /// Thread-local RPC endpoint.
-///
-/// This type accepts a generic type that specifies the transport layer.
-/// Available transports are provided in the [`crate::transport`] module.
-///
-/// This is the main type of this library.
 pub struct Rpc {
     /// ID of this RPC instance.
     id: RpcId,
