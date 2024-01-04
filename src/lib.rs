@@ -1,4 +1,4 @@
-//! A simple RPC library that is designed following eRPC's ideas.
+//! A simple **unsound** RDMA RPC library.
 
 mod handler;
 mod msgbuf;
@@ -16,6 +16,8 @@ pub use self::nexus::Nexus;
 pub use self::request::Request;
 pub use self::rpc::Rpc;
 pub use self::session::SessionHandle as Session;
+
+pub use self::handler::RequestHandle;
 
 #[cfg(test)]
 mod tests;

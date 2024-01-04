@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 
 use crate::transport::{LKey, UdTransport};
@@ -36,7 +37,10 @@ impl InBuddyBuffer {
     }
 }
 
-pub(crate) struct BuddyAllocator {
+/// The true buddy allocator, but it cannot be directly exposed to the crate
+/// since there are pointer-based accesses triggered by dropping a `MsgBuf`.
+///
+struct BuddyAllocatorInner {
     /// Buddy system.
     buddy: [Vec<InBuddyBuffer>; Self::NUM_CLASSES],
 
@@ -48,9 +52,9 @@ pub(crate) struct BuddyAllocator {
     next_alloc: usize,
 }
 
-impl BuddyAllocator {
-    pub const MIN_ALLOC_SIZE: usize = 1 << 6;
-    pub const MAX_ALLOC_SIZE: usize = 1 << 24;
+impl BuddyAllocatorInner {
+    const MIN_ALLOC_SIZE: usize = 1 << 6;
+    const MAX_ALLOC_SIZE: usize = 1 << 24;
     const NUM_CLASSES: usize =
         (Self::MAX_ALLOC_SIZE / Self::MIN_ALLOC_SIZE).trailing_zeros() as usize + 1;
 
@@ -107,9 +111,9 @@ impl BuddyAllocator {
     }
 }
 
-impl BuddyAllocator {
+impl BuddyAllocatorInner {
     /// Create a new buddy allocator with no pre-allocation.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             buddy: Default::default(),
             mem_registry: Vec::new(),
@@ -118,7 +122,7 @@ impl BuddyAllocator {
     }
 
     /// Allocate a new buffer with at least the given length.
-    pub fn alloc(&mut self, len: usize, tp: &mut UdTransport) -> Buffer {
+    fn alloc(&mut self, len: usize, tp: &mut UdTransport) -> Buffer {
         assert!(
             len <= Self::MAX_ALLOC_SIZE,
             "requested buffer too large (maximum: {}MB)",
@@ -141,12 +145,17 @@ impl BuddyAllocator {
             debug_assert!(!self.buddy[class].is_empty());
         }
         let buf = self.buddy[class].pop().unwrap();
-        Buffer::real(self, buf.buf, Self::size_of_class(class), buf.lkey)
+        Buffer::real(
+            self as *mut _ as _,
+            buf.buf,
+            Self::size_of_class(class),
+            buf.lkey,
+        )
     }
 
     /// Free a buffer.
     /// This does not actually free the memory, but returns it to the buddy allocator.
-    pub fn free(&mut self, buf: &mut Buffer) {
+    fn free(&mut self, buf: &mut Buffer) {
         let class = Self::class_of(buf.len());
         self.buddy[class].push(InBuddyBuffer::new(
             // SAFETY: `buf.as_ptr()` returns the raw pointer stored in `NonNull`.
@@ -156,8 +165,39 @@ impl BuddyAllocator {
     }
 }
 
-impl Default for BuddyAllocator {
-    fn default() -> Self {
-        Self::new()
+/// The buddy allocator that never combines buddies.
+#[repr(transparent)]
+pub(crate) struct BuddyAllocator {
+    inner: UnsafeCell<BuddyAllocatorInner>,
+}
+
+impl BuddyAllocator {
+    /// The maximum allocation size, 16MB.
+    pub const MAX_ALLOC_SIZE: usize = 1 << 24;
+
+    /// Create a new buddy allocator with no pre-allocation.
+    pub fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(BuddyAllocatorInner::new()),
+        }
+    }
+
+    /// Allocate a new buffer with at least the given length.
+    pub fn alloc(&mut self, len: usize, tp: &mut UdTransport) -> Buffer {
+        self.inner.get_mut().alloc(len, tp)
+    }
+
+    /// Free a buffer.
+    /// This does not actually free the memory, but returns it to the buddy allocator.
+    pub fn free(&mut self, buf: &mut Buffer) {
+        self.inner.get_mut().free(buf)
+    }
+}
+
+impl BuddyAllocator {
+    /// Free a buffer with a `*mut Self` pointer.
+    /// This does not actually free the memory, but returns it to the buddy allocator.
+    pub unsafe fn free_by_ptr(mut this: NonNull<Self>, buf: &mut Buffer) {
+        this.as_mut().free(buf)
     }
 }

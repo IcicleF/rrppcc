@@ -22,7 +22,17 @@ pub(crate) type ReqHandlerFuture = Pin<Box<dyn Future<Output = MsgBuf> + Send + 
 /// The response should be filled in the buffer pointed by `resp_buf`.
 pub(crate) type ReqHandler = Box<dyn Fn(RequestHandle) -> ReqHandlerFuture + Send + Sync + 'static>;
 
-/// RPC request handle.
+/// RPC request handle exposed to request handlers.
+///
+/// # Unsoundness
+///
+/// This type is unsound. The request handle must not be moved outside of
+/// the request handler function. If there are any accesses to any data
+/// derived from the request handle outside of the request handler function,
+/// your program can observe inconsistent data. UB is unlikely to occur,
+/// though, as there are runtime checks preventing accesses from other threads
+/// despite that this type is `Send` and `Sync` (which is to make the compiler
+/// happy).
 pub struct RequestHandle {
     /// Pointer to the `Rpc` instance that calls this handler function.
     rpc: &'static Rpc,
