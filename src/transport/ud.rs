@@ -344,8 +344,8 @@ impl UdTransport {
             let msgbuf = &*item.msgbuf;
             let length: u32;
 
-            // Send header + data if small, header + control otherwise.
-            if likely(msgbuf.len() <= Self::max_data_in_pkt()) {
+            // Send header + data (contiguous) if small, header + control otherwise.
+            if likely(msgbuf.is_small()) {
                 length = (mem::size_of::<PacketHeader>() + msgbuf.len()) as _;
                 sge[0] = ibv_sge {
                     addr: msgbuf.pkt_hdr() as _,

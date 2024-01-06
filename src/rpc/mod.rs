@@ -111,11 +111,47 @@ pub struct Rpc {
     _pinned: PhantomPinned,
 }
 
-/// A macro that handles response retransmission logic.
+/// A macro that handles response transmission logic.
+/// - `ENQUEUE`: normal response enqueue, after calling the handler.
+/// - `RETRANSMIT`: detect and retransmission of generated response, before even
+///                 calling the handler.
+///
 /// This is a macro instead of a method becuase the latter will make the borrow
 /// checker very unhappy.
-macro_rules! process_response_retx {
-    ($id:expr, $state:ident, $sess:ident, $sslot:ident, $req_idx:ident, $req_type:ident) => {
+macro_rules! do_response_tx {
+    (ENQUEUE, $state:ident, $sess:ident, $sslot:ident, $resp:ident) => {
+        // Write the packet header of the response MsgBuf.
+        // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
+        unsafe {
+            ptr::write_volatile(
+                $resp.pkt_hdr(),
+                PacketHeader::new(
+                    $sslot.req_type,
+                    $resp.len() as _,
+                    $sess.peer_sess_id,
+                    $sslot.req_idx,
+                    if likely($resp.is_small()) {
+                        PktType::SmallResp
+                    } else {
+                        PktType::LargeResp
+                    }
+                ),
+            )
+        };
+
+        // Store the response buffer in the SSlot.
+        // Previous response buffer will be buried at this point.
+        $sslot.resp = $resp;
+        $sslot.finished = true;
+
+        // Push the packet to the pending TX queue.
+        $state.pending_tx.push(TxItem {
+            peer: $sess.peer.as_ref().unwrap(),
+            msgbuf: &$sslot.resp,
+        });
+    };
+
+    (RETRANSMIT, $id:expr, $state:ident, $sess:ident, $sslot:ident, $req_idx:ident, $req_type:ident) => {
         // Simply drop outdated requests.
         if $req_idx < $sslot.req_idx {
             log::debug!(
@@ -206,7 +242,7 @@ impl Rpc {
         // Check request index sanity.
         let req_idx = hdr.req_idx();
         if unlikely(req_idx <= sslot.req_idx) {
-            process_response_retx!(self.id, state, sess, sslot, req_idx, req_type);
+            do_response_tx!(RETRANSMIT, self.id, state, sess, sslot, req_idx, req_type);
             return true;
         }
 
@@ -240,36 +276,7 @@ impl Rpc {
         let sslot = &mut sess.slots[sslot_idx];
         match response {
             Poll::Ready(resp) => {
-                assert!(
-                    resp.len() <= UdTransport::max_data_in_pkt(),
-                    "large response unimplemented yet"
-                );
-
-                // Write the packet header of the response MsgBuf.
-                // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
-                unsafe {
-                    ptr::write(
-                        resp.pkt_hdr(),
-                        PacketHeader::new(
-                            sslot.req_type,
-                            resp.len() as _,
-                            sess.peer_sess_id,
-                            sslot.req_idx,
-                            PktType::SmallResp,
-                        ),
-                    )
-                };
-
-                // Store the response buffer in the SSlot.
-                // Previous response buffer will be buried at this point.
-                sslot.resp = resp;
-                sslot.finished = true;
-
-                // Push the packet to the pending Tx queue.
-                state.pending_tx.push(TxItem {
-                    peer: sess.peer.as_ref().unwrap(),
-                    msgbuf: &sslot.resp,
-                });
+                do_response_tx!(ENQUEUE, state, sess, sslot, resp);
                 true
             }
             Poll::Pending => {
@@ -286,7 +293,7 @@ impl Rpc {
     ///
     /// This method never calls request handlers; instead, it only updates the `SSlot`
     /// and posts an RDMA read to fetch the request data. Therefore, it is safe to take
-    /// a `&mut RpcInterior` as parameter.
+    /// a `&mut RpcInterior` as argument.
     fn process_large_request_control(
         &self,
         state: &mut RpcInterior,
@@ -318,7 +325,7 @@ impl Rpc {
         // Check request index sanity.
         let req_idx = hdr.req_idx();
         if unlikely(req_idx <= sslot.req_idx) {
-            process_response_retx!(self.id, state, sess, sslot, req_idx, req_type);
+            do_response_tx!(RETRANSMIT, self.id, state, sess, sslot, req_idx, req_type);
             return;
         }
 
@@ -349,15 +356,14 @@ impl Rpc {
     ///
     /// Panic if `self.state` is already borrowed.
     fn process_large_request_body(&self, sess_id: SessId, sslot_idx: usize) {
-        let mut real_state = self.state.borrow_mut();
-        let state: &mut RpcInterior = &mut real_state;
+        let state = self.state.borrow();
+        let sess = &state.sessions[sess_id as usize];
+        let sslot = &sess.slots[sslot_idx];
 
-        let sess = &mut state.sessions[sess_id as usize];
-        let sslot = &mut sess.slots[sslot_idx];
-
+        // No need for any sanity check, as that is already done when handling the control message.
         // Construct the request. This will fetch the raw pointer of the current `Rpc` and `sslot`.
         let request = RequestHandle::new(self, sslot);
-        drop(real_state);
+        drop(state);
 
         // Call the request handler with no `state` borrows.
         let mut resp_fut = self.nexus.call_rpc_handler(request);
@@ -375,36 +381,7 @@ impl Rpc {
         let sslot = &mut sess.slots[sslot_idx];
         match response {
             Poll::Ready(resp) => {
-                assert!(
-                    resp.len() <= UdTransport::max_data_in_pkt(),
-                    "large response unimplemented yet"
-                );
-
-                // Write the packet header of the response MsgBuf.
-                // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
-                unsafe {
-                    ptr::write(
-                        resp.pkt_hdr(),
-                        PacketHeader::new(
-                            sslot.req_type,
-                            resp.len() as _,
-                            sess.peer_sess_id,
-                            sslot.req_idx,
-                            PktType::SmallResp,
-                        ),
-                    )
-                };
-
-                // Store the response buffer in the SSlot.
-                // Previous response buffer will be buried at this point.
-                sslot.resp = resp;
-                sslot.finished = true;
-
-                // Push the packet to the pending Tx queue.
-                state.pending_tx.push(TxItem {
-                    peer: sess.peer.as_ref().unwrap(),
-                    msgbuf: &sslot.resp,
-                });
+                do_response_tx!(ENQUEUE, state, sess, sslot, resp);
             }
             Poll::Pending => {
                 state
@@ -418,7 +395,7 @@ impl Rpc {
     /// Always release the correponding transport-held buffer when returning.
     ///
     /// This method never calls request handlers, so it is safe to take a `&mut RpcInterior`
-    /// as parameter.
+    /// as argument.
     fn process_small_response(
         &self,
         state: &mut RpcInterior,
@@ -443,9 +420,10 @@ impl Rpc {
                 "response for future request is impossible"
             );
             log::debug!(
-                "RPC {}: dropping received SmallResponse for expired request (idx {})",
+                "RPC {}: dropping received SmallResponse for expired request (idx {}, current {})",
                 self.id,
-                hdr.req_idx()
+                hdr.req_idx(),
+                sslot.req_idx
             );
             return;
         }
@@ -457,6 +435,63 @@ impl Rpc {
         // SAFETY: source is guaranteed to be valid, destination length checked, may not overlap.
         unsafe { ptr::copy_nonoverlapping(data, sslot.resp.as_ptr(), len) };
         sslot.finished = true;
+    }
+
+    /// Process a control message of a large response.
+    /// Always release the corresponding transport-held buffer when returning.
+    ///
+    /// This method never calls request handlers, so it is safe to take a `&mut RpcInterior`
+    /// as argument.
+    fn process_large_response_control(
+        &self,
+        state: &mut RpcInterior,
+        sess_id: SessId,
+        sslot_idx: usize,
+        hdr: &PacketHeader,
+        ctrl: &ControlMsg,
+    ) {
+        debug_assert_eq!(
+            hdr.pkt_type(),
+            PktType::LargeResp,
+            "packet type is not large-response-ctrl"
+        );
+
+        let sess = &mut state.sessions[sess_id as usize];
+        let sslot = &mut sess.slots[sslot_idx];
+
+        // Check packet metadata sanity.
+        if unlikely(hdr.req_idx() != sslot.req_idx) {
+            assert!(
+                hdr.req_idx() < sslot.req_idx,
+                "response for future request is impossible"
+            );
+            log::debug!(
+                "RPC {}: dropping received LargeResponse for expired request (idx {}, current {})",
+                self.id,
+                hdr.req_idx(),
+                sslot.req_idx
+            );
+            return;
+        }
+
+        // Truncate response if needed.
+        let len = cmp::min(sslot.resp.capacity(), hdr.data_len() as usize);
+        sslot.resp.set_len(len);
+
+        // Post an RDMA read to fetch the response data.
+        state
+            .rc_tp
+            .post_rc_read(sess_id, sslot_idx, &sess.rc_qp, &sslot.resp, ctrl);
+    }
+
+    /// Process an actual large response.
+    ///
+    /// This method never calls request handlers, so it is safe to take a `&mut Session`
+    /// as argument (derived from interior state).
+    #[inline]
+    fn process_large_response_body(&self, sess: &mut Session, sslot_idx: usize) {
+        // Data already in the buffer, just mark the request as finished.
+        sess.slots[sslot_idx].finished = true;
     }
 }
 
@@ -612,9 +647,6 @@ impl Rpc {
 
         // First, do UD Rx burst.
         let n = state.tp.rx_burst();
-        if n == 0 {
-            return;
-        }
 
         // Process the received packets.
         let mut rx_bufs_to_release = Vec::with_capacity(n);
@@ -702,34 +734,41 @@ impl Rpc {
             }
 
             // Trigger packet processing logic.
-            match hdr.pkt_type() {
+            let sslot_idx = hdr.req_idx() as usize % ACTIVE_REQ_WINDOW;
+            match pkt_type {
                 PktType::SmallReq => rx_requests.push(item),
                 PktType::LargeReq => {
-                    let sslot_idx = hdr.req_idx() as usize % ACTIVE_REQ_WINDOW;
+                    // SAFETY: control packet sanity checked.
                     let ctrl = unsafe { &*(item.as_ptr() as *const ControlMsg) };
-                    self.process_large_request_control(state, sess_id, sslot_idx, hdr, ctrl)
+                    self.process_large_request_control(state, sess_id, sslot_idx, hdr, ctrl);
+                    rx_bufs_to_release.push(item);
                 }
                 PktType::SmallResp => {
-                    let sslot_idx = hdr.req_idx() as usize % ACTIVE_REQ_WINDOW;
                     self.process_small_response(state, sess_id, sslot_idx, hdr, item.as_ptr());
                     rx_bufs_to_release.push(item);
                 }
-                PktType::LargeResp => todo!("long response"),
+                PktType::LargeResp => {
+                    // SAFETY: control packet sanity checked.
+                    let ctrl = unsafe { &*(item.as_ptr() as *const ControlMsg) };
+                    self.process_large_response_control(state, sess_id, sslot_idx, hdr, ctrl);
+                    rx_bufs_to_release.push(item);
+                }
             }
         }
 
         // Second, do RC Rx burst.
         // This step processes only self-produced data, so no need for release-mode
         // runtime sanity check.
-        let n = state.rc_tp.rx_burst();
+        let n = state.rc_tp.tx_completion_burst();
         let mut rx_large_requests = Vec::with_capacity(n);
+
         for (sess_id, sslot_idx) in state.rc_tp.tx_done() {
-            debug_assert!(sess_id < state.sessions.len() as SessId);
+            debug_assert!((sess_id as usize) < state.sessions.len());
             debug_assert!(sslot_idx < ACTIVE_REQ_WINDOW);
 
             let sess = &mut state.sessions[sess_id as usize];
             if sess.is_client() {
-                todo!("long response");
+                self.process_large_response_body(sess, sslot_idx);
             } else {
                 rx_large_requests.push((sess_id, sslot_idx));
             }
@@ -808,11 +847,6 @@ impl Rpc {
 
         // Then, transmit the responses.
         for (sess_id, sslot_idx, resp) in finished_handlers {
-            assert!(
-                resp.len() <= UdTransport::max_data_in_pkt(),
-                "large response unimplemented yet"
-            );
-
             let sess = &mut state.sessions[sess_id as usize];
             let sslot = &mut sess.slots[sslot_idx];
 
@@ -824,31 +858,7 @@ impl Rpc {
             //   to this buffer.
             unsafe { state.tp.rx_release(&sslot.req) };
 
-            // Write the packet header of the response MsgBuf.
-            // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
-            unsafe {
-                ptr::write(
-                    resp.pkt_hdr(),
-                    PacketHeader::new(
-                        sslot.req_type,
-                        resp.len() as _,
-                        sess.peer_sess_id,
-                        sslot.req_idx,
-                        PktType::SmallResp,
-                    ),
-                )
-            };
-
-            // Store the response buffer in the SSlot.
-            // Previous response buffer will be buried at this point.
-            sslot.resp = resp;
-            sslot.finished = true;
-
-            // Push the packet to the pending TX queue.
-            state.pending_tx.push(TxItem {
-                peer: sess.peer.as_ref().unwrap(),
-                msgbuf: &sslot.resp,
-            });
+            do_response_tx!(ENQUEUE, state, sess, sslot, resp);
         }
     }
 }
@@ -920,7 +930,7 @@ impl Rpc {
             // Fill in the request packet header.
             // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
             unsafe {
-                ptr::write(
+                ptr::write_volatile(
                     req_msgbuf.pkt_hdr(),
                     PacketHeader::new(
                         req_type,
@@ -960,7 +970,7 @@ impl Rpc {
             // Fill in the packet header.
             // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
             unsafe {
-                ptr::write(
+                ptr::write_volatile(
                     req_msgbuf.pkt_hdr(),
                     PacketHeader::new(
                         req_type,
@@ -1027,7 +1037,10 @@ impl Rpc {
 
         // Now we must have `sslot.req_idx == req_idx`.
         if sslot.finished {
+            // Modify user-provided response buffer length.
             resp_buf.set_len(sslot.resp.len());
+
+            // Move the SSlot to  the next request.
             sslot.req_idx += ACTIVE_REQ_WINDOW as ReqIdx;
 
             // Make a pending request active, if there is any.

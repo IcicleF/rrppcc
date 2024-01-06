@@ -42,15 +42,17 @@ pub(crate) struct RcTransport {
     /// The send completion queue.
     /// It is also the recv CQ, but this transport never posts receives.
     cq: Cq,
-
     /// Number of outstanding send requests.
     outstanding_sends: usize,
-
     /// Reserved work completions.
     wc: Vec<Wc>,
-
     /// `wr_id`s of finished sends.
     tx_done: Vec<WrId>,
+
+    /// Cached RDMA read WR SGE.
+    rdma_read_sge: Box<ibv_sge>,
+    /// Cached RDMA read WR.
+    rdma_read_wr: ibv_send_wr,
 }
 
 impl RcTransport {
@@ -63,13 +65,26 @@ impl RcTransport {
     pub fn new(ud_tp: &UdTransport) -> Self {
         let ctx = ud_tp.pd().context();
         let cq = Cq::new(ctx, Self::CQ_DEPTH as _).expect("failed to create RC CQ");
-
         let wc = vec![Wc::default(); Self::CQ_POLL_BATCH];
+
+        // Initialize the read SGE and WR.
+        let mut rdma_read_sge = Box::<ibv_sge>::default();
+        let rdma_read_wr = ibv_send_wr {
+            sg_list: rdma_read_sge.as_mut(),
+            num_sge: 1,
+            opcode: ibv_wr_opcode::IBV_WR_RDMA_READ,
+            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..unsafe { mem::zeroed() }
+        };
+
         Self {
             cq,
             outstanding_sends: 0,
             wc,
             tx_done: Vec::with_capacity(Self::CQ_DEPTH),
+
+            rdma_read_sge,
+            rdma_read_wr,
         }
     }
 
@@ -110,43 +125,39 @@ impl RcTransport {
     ) {
         // Reserve enough CQ space.
         while unlikely(self.outstanding_sends + 1 > Self::CQ_DEPTH) {
-            self.rx_burst();
+            self.tx_completion_burst();
         }
         self.outstanding_sends += 1;
 
         // Fill in the SGE & WR fields.
-        let mut sge = ibv_sge {
+        *self.rdma_read_sge = ibv_sge {
             addr: buf.as_ptr() as _,
             length: buf.len() as _,
             lkey: buf.lkey(),
         };
 
-        let mut wr = ibv_send_wr {
-            wr_id: (sess_id as u64) << 32 | (sslot_idx as u64),
-            sg_list: &mut sge,
-            num_sge: 1,
-            opcode: ibv_wr_opcode::IBV_WR_RDMA_READ,
-            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
-            ..unsafe { mem::zeroed() }
-        };
+        let wr = &mut self.rdma_read_wr;
+        wr.wr_id = (sess_id as u64) << 32 | (sslot_idx as u64);
         wr.wr.rdma.remote_addr = ctrl.addr as _;
         wr.wr.rdma.rkey = ctrl.rkey;
 
         // SAFETY: the work request is correctly constructed.
         unsafe {
             rc_qp
-                .post_raw_send(&wr)
+                .post_raw_send(wr)
                 .expect("failed to post read request");
         };
     }
 
-    /// Poll the CQ to check for receive messages.
+    /// Poll the CQ to check for Tx completions.
     #[inline]
-    pub fn rx_burst(&mut self) -> usize {
+    pub fn tx_completion_burst(&mut self) -> usize {
         let n = self.cq.poll_into(&mut self.wc).expect("failed to poll CQ") as usize;
+        assert!(n <= self.outstanding_sends);
         self.outstanding_sends -= n;
+
         for i in 0..n {
-            assert_eq!(self.wc[i].status(), WcStatus::Success, "failed to send");
+            assert_eq!(self.wc[i].status(), WcStatus::Success, "failed to read");
             self.tx_done.push(self.wc[i].wr_id());
         }
         self.tx_done.len()

@@ -97,7 +97,7 @@ impl MsgBuf {
 
         // SAFETY: `MsgBuf::ctrl_msg()` ensures buffer validity.
         unsafe {
-            ptr::write(
+            ptr::write_volatile(
                 ctrl,
                 ControlMsg {
                     addr: ret.as_ptr() as _,
@@ -109,14 +109,13 @@ impl MsgBuf {
     }
 
     /// Create a new `MsgBuf` on owned buffer, but guarantee that the buffer
-    /// will never be mutated. Therefore, we do not need to store the header,
-    /// nor the control message. Only application data, no extra metadata.
+    /// will never be mutated. Therefore, we do not need to store the header
+    /// or the control message, and do not need to roundup data length.
+    /// Only store application data, no metadata at all.
     #[inline]
     pub(crate) fn owned_immutable(buf: Buffer, data_len: usize) -> Self {
         // Roundup data length to multiplicity of 8.
-        let data_len = data_len.next_multiple_of(8);
         assert!(data_len < Self::MAX_DATA_LEN);
-
         Self {
             // SAFETY: guaranteed not null.
             data: unsafe { NonNull::new_unchecked(buf.as_ptr()) },
@@ -234,12 +233,14 @@ impl MsgBuf {
     }
 
     /// Return the length of application data.
+    #[allow(clippy::len_without_is_empty)]
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Return the capacity of application data.
+    /// This is the largest value that can be passed into [`set_len()`](`Self::set_len()`).
     #[inline(always)]
     pub fn capacity(&self) -> usize {
         self.max_len
@@ -254,7 +255,7 @@ impl MsgBuf {
     pub fn set_len(&mut self, len: usize) {
         assert!(
             len <= self.max_len,
-            "len {} > MsgBuf capacity {}",
+            "desired MsgBuf len {} > capacity {}",
             len,
             self.max_len
         );

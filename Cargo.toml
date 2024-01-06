@@ -30,6 +30,7 @@ quanta = "0.12"
 simple_logger = { version = "4.2.0", features = ["threads"] }
 tokio = { version = "1", features = ["full"] }
 criterion = "0.5"
+rand = "0.8"
 
 [features]
 default = ["infiniband"]
