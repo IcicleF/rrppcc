@@ -55,6 +55,23 @@ impl NexusSm {
 }
 
 /// A per-process singleton used for library initialization.
+///
+/// The main purpose of this type is binding handlers to specific request
+/// types. All handlers should be set before any [`Rpc`](`crate::Rpc`)s are
+/// created.
+///
+/// # Background threads
+///
+/// On creation, the `Nexus` launches a session management thread
+/// and a [`quanta::Upkeep`] thread. The former is for establishing
+/// sessions between `Rpc`s, and the latter is for providing ms-precision
+/// time for packet loss detection.
+///
+/// Logically, it can be meaningful to have multiple `Nexus`es in a process,
+/// so if the `Upkeep` thread fails to start due to an existing one, the
+/// `Nexus` will still be created. Be aware that if the existing `Upkeep`
+/// thread is launched by you, then your configuration will affect the
+/// packet loss detection of all `Rpc`s in the process.
 pub struct Nexus {
     rpc_handlers: [Option<ReqHandler>; ReqType::MAX as usize + 1],
 
@@ -158,6 +175,9 @@ impl Nexus {
 
     /// Set the handler for the given request type.
     /// This must be done before any [`Rpc`](`crate::Rpc`)s are created on this `Nexus`.
+    ///
+    /// The handler takes a request handle as argument, and must return a `MsgBuf` that
+    /// belongs to the same `Rpc` calling the handler (otherwise, panic).
     ///
     /// # Panics
     ///

@@ -1,4 +1,16 @@
-//! A simple **unsound** RDMA RPC library.
+//! # rrppcc
+//!
+#![cfg_attr(not(doctest), doc = include_str!("../README.md"))]
+//!
+//! ## Example
+//!
+//! This example sets up a server and a client on two threads, and sends a request
+//! from the client to the server. It assumes that the UDP port 31850 and 31851 can
+//! be used.
+//!
+//! ```rust
+#![doc = include_str!("../examples/hello.rs")]
+//! ```
 
 mod handler;
 mod msgbuf;

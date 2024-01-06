@@ -7,6 +7,11 @@ use crate::util::{buddy::BuddyAllocator, buffer::*, likely::*};
 
 /// Message buffer that can contain application data for
 /// requests or accommodate responses.
+///
+/// # Unsoundness
+///
+/// You must not drop any `MsgBuf` you allocated later than its
+/// belonging `Rpc`. Otherwise, there will be undefined behavior.
 pub struct MsgBuf {
     /// Pointer to the first *application data* byte.
     data: NonNull<u8>,
