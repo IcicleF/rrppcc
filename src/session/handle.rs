@@ -79,17 +79,17 @@ impl<'r> SessionHandle<'r> {
     {
         if likely(!self.is_connected()) {
             // Mark the session as connecting.
-            self.rpc.mark_session_connecting(self.sess_id);
+            let (cli_ud_ep, cli_sess_rc_ep) = self.rpc.mark_session_connecting(self.sess_id);
 
             // Send a connect request to the remote peer.
-            let ep = rmps::to_vec(&self.rpc.datagram_endpoint()).unwrap();
             let event = SmEvent {
                 src_rpc_id: self.rpc.id(),
                 dst_rpc_id: self.remote_rpc_id,
                 details: SmEventDetails::ConnectRequest {
                     cli_uri: self.rpc.nexus().uri(),
-                    cli_ep: ep,
+                    cli_ud_ep,
                     cli_sess_id: self.sess_id,
+                    cli_sess_rc_ep,
                 },
             };
 

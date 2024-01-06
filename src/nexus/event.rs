@@ -1,8 +1,8 @@
-use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crossbeam::queue::SegQueue;
+use rrddmma::rdma::qp::QpEndpoint;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -19,20 +19,22 @@ pub(crate) enum ConnectRefuseReason {
 }
 
 /// Details of a [`SmEvent`].
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum SmEventDetails {
     /// A request sent from remote peer to connect to a local [`Rpc`].
     ConnectRequest {
         cli_uri: SocketAddr,
-        cli_ep: Vec<u8>,
+        cli_ud_ep: QpEndpoint,
         cli_sess_id: SessId,
+        cli_sess_rc_ep: QpEndpoint,
     },
 
     /// Positive response of a `ConnectRequest`.
     ConnectAcknowledge {
         cli_sess_id: SessId,
-        svr_ep: Vec<u8>,
+        svr_ud_ep: QpEndpoint,
         svr_sess_id: SessId,
+        svr_sess_rc_ep: QpEndpoint,
     },
 
     /// Negative response of a `ConnectRequest`.
@@ -43,49 +45,6 @@ pub(crate) enum SmEventDetails {
 
     /// Disconnect request from remote peer.
     Disconnect,
-}
-
-impl fmt::Debug for SmEventDetails {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct OpaqueEpHelper(usize);
-        impl fmt::Debug for OpaqueEpHelper {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "<{} bytes opaque>", self.0)
-            }
-        }
-
-        match self {
-            SmEventDetails::ConnectRequest {
-                cli_uri,
-                cli_ep,
-                cli_sess_id,
-            } => f
-                .debug_struct("ConnectRequest")
-                .field("cli_uri", cli_uri)
-                .field("cli_ep", &OpaqueEpHelper(cli_ep.len()))
-                .field("cli_sess_id", cli_sess_id)
-                .finish(),
-            SmEventDetails::ConnectAcknowledge {
-                cli_sess_id,
-                svr_ep,
-                svr_sess_id,
-            } => f
-                .debug_struct("ConnectAcknowledge")
-                .field("cli_sess_id", cli_sess_id)
-                .field("svr_ep", &OpaqueEpHelper(svr_ep.len()))
-                .field("svr_sess_id", svr_sess_id)
-                .finish(),
-            SmEventDetails::ConnectRefuse {
-                cli_sess_id,
-                reason,
-            } => f
-                .debug_struct("ConnectRefuse")
-                .field("cli_sess_id", cli_sess_id)
-                .field("reason", reason)
-                .finish(),
-            SmEventDetails::Disconnect => f.debug_struct("Disconnect").finish(),
-        }
-    }
 }
 
 /// Event triggered by the [`Nexus`] and handled by the [`Rpc`] instances.

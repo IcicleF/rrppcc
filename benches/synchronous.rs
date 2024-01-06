@@ -13,11 +13,7 @@ pub fn benchmark_idle(c: &mut Criterion) {
     let rpc = Rpc::new(&nx, 1, "mlx5_0", 1);
 
     // Benchmark idle event-loop latency.
-    c.bench_function("idle-eventloop", |b| {
-        b.iter(|| {
-            rpc.progress();
-        })
-    });
+    c.bench_function("idle-eventloop", |b| b.iter(|| rpc.progress()));
 }
 
 pub fn benchmark_sync(c: &mut Criterion) {

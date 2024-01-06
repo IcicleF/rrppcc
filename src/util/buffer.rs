@@ -1,6 +1,6 @@
 use std::ptr::{self, NonNull};
 
-use crate::transport::LKey;
+use crate::transport::{LKey, RKey};
 use crate::util::buddy::*;
 
 pub(crate) struct Buffer {
@@ -10,8 +10,11 @@ pub(crate) struct Buffer {
     /// Length of the buffer.
     len: usize,
 
-    /// Memory handle.
+    /// Local memory handle.
     lkey: LKey,
+
+    /// Remote memory handle.
+    rkey: RKey,
 
     /// Pointer to the buddy allocator.
     owner: *mut BuddyAllocator,
@@ -20,22 +23,30 @@ pub(crate) struct Buffer {
 impl Buffer {
     /// A real buffer that will be deallocated when dropped.
     #[inline]
-    pub fn real(owner: *mut BuddyAllocator, buf: NonNull<u8>, len: usize, lkey: LKey) -> Self {
+    pub fn real(
+        owner: *mut BuddyAllocator,
+        buf: NonNull<u8>,
+        len: usize,
+        lkey: LKey,
+        rkey: RKey,
+    ) -> Self {
         Self {
             buf,
             len,
             lkey,
+            rkey,
             owner,
         }
     }
 
-    /// A fake buffer that only serves to record a LKey, and does nothing when dropped.
+    /// A fake buffer that only serves to record `(LKey, RKey)`, and does nothing when dropped.
     #[inline]
-    pub fn fake(lkey: LKey) -> Self {
+    pub fn fake(lkey: LKey, rkey: RKey) -> Self {
         Self {
             buf: NonNull::dangling(),
             len: 0,
             lkey,
+            rkey,
             owner: ptr::null_mut(),
         }
     }
@@ -52,10 +63,16 @@ impl Buffer {
         self.len
     }
 
-    /// Get the memory handle of the buffer.
+    /// Get the local key of the buffer.
     #[inline(always)]
     pub fn lkey(&self) -> LKey {
         self.lkey
+    }
+
+    /// Get the remote key of the buffer.
+    #[inline(always)]
+    pub fn rkey(&self) -> RKey {
+        self.rkey
     }
 }
 

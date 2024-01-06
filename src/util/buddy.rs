@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 
-use crate::transport::{LKey, UdTransport};
+use crate::transport::{LKey, RKey, UdTransport};
 use crate::util::{buffer::*, huge_alloc::*};
 
 /// A buffer that represents a piece of unallocated memory in the buddy allocator.
@@ -12,15 +12,18 @@ struct InBuddyBuffer {
     /// Start address of the buffer.
     buf: NonNull<u8>,
 
-    /// Memory handle.
+    /// Local key.
     lkey: LKey,
+
+    /// Remote key.
+    rkey: RKey,
 }
 
 impl InBuddyBuffer {
     /// Create a new buffer.
     #[inline(always)]
-    pub fn new(buf: NonNull<u8>, lkey: LKey) -> Self {
-        Self { buf, lkey }
+    pub fn new(buf: NonNull<u8>, lkey: LKey, rkey: RKey) -> Self {
+        Self { buf, lkey, rkey }
     }
 
     /// Return a new buffer that starts at an offset to the current one.
@@ -33,6 +36,7 @@ impl InBuddyBuffer {
         InBuddyBuffer {
             buf: NonNull::new_unchecked(self.buf.as_ptr().add(offset)),
             lkey: self.lkey,
+            rkey: self.rkey,
         }
     }
 }
@@ -66,12 +70,13 @@ impl BuddyAllocatorInner {
         debug_assert!(len % Self::MAX_ALLOC_SIZE == 0);
 
         let mem = alloc_raw(len);
-        let lkey = unsafe { tp.reg_mem(mem.ptr, len) };
+        let (lkey, rkey) = unsafe { tp.reg_mem(mem.ptr, len) };
 
         for i in 0..(len / Self::MAX_ALLOC_SIZE) {
             self.buddy[Self::NUM_CLASSES - 1].push(InBuddyBuffer::new(
                 unsafe { NonNull::new_unchecked(mem.ptr.add(i * Self::MAX_ALLOC_SIZE)) },
                 lkey,
+                rkey,
             ));
         }
         self.mem_registry.push(mem);
@@ -150,6 +155,7 @@ impl BuddyAllocatorInner {
             buf.buf,
             Self::size_of_class(class),
             buf.lkey,
+            buf.rkey,
         )
     }
 
@@ -161,6 +167,7 @@ impl BuddyAllocatorInner {
             // SAFETY: `buf.as_ptr()` returns the raw pointer stored in `NonNull`.
             unsafe { NonNull::new_unchecked(buf.as_ptr()) },
             buf.lkey(),
+            buf.rkey(),
         ));
     }
 }

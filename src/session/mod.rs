@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
-use rrddmma::rdma::qp::QpPeer;
+use rrddmma::rdma::qp::{Qp, QpPeer};
 
 pub use self::handle::*;
 pub(crate) use self::sslot::*;
@@ -47,8 +47,10 @@ pub(crate) struct Session {
     pub peer_rpc_id: RpcId,
     /// Remote peer's session ID.
     pub peer_sess_id: SessId,
-    /// Remote peer routing information.
+    /// Remote peer routing information (for UD transport).
     pub peer: Option<QpPeer>,
+    /// Connection to the remote peer.
+    pub rc_qp: Qp,
 
     /// Session request slots.
     ///
@@ -68,12 +70,14 @@ pub(crate) struct Session {
 
 impl Session {
     /// Create a new session with empty peer information.
-    pub fn new(state: &mut RpcInterior, role: SessionRole) -> Self {
+    pub fn new(state: &mut RpcInterior, role: SessionRole, rc_qp: Qp) -> Self {
+        // Initialize SSlots.
         let initial_psn_base = match role {
             SessionRole::Client => ACTIVE_REQ_WINDOW,
             SessionRole::Server => 0,
         };
         let slots = array::from_fn(|i| SSlot::new(state, role, (i + initial_psn_base) as _));
+
         Self {
             role,
             connected: Some(false),
@@ -82,6 +86,7 @@ impl Session {
             peer_rpc_id: 0,
             peer_sess_id: 0,
             peer: None,
+            rc_qp,
 
             slots: Box::pin(slots),
             avail_slots: (0..ACTIVE_REQ_WINDOW).collect(),

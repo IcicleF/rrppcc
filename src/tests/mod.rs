@@ -368,3 +368,60 @@ fn nested_simple() {
     svr1_handle.join().unwrap();
     svr2_handle.join().unwrap();
 }
+
+#[test]
+fn large_req() {
+    let cli_port = next_port();
+    let svr_port = next_port();
+
+    let (tx, rx) = mpsc::channel();
+    let (tx2, rx2) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let mut nx = Nexus::new(("127.0.0.1", svr_port));
+        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+            let mut resp_buf = req.pre_resp_buf();
+            unsafe {
+                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+            };
+            resp_buf.set_len(HELLO_WORLD.len());
+            resp_buf
+        });
+
+        let rpc = Rpc::new(&nx, 2, "mlx5_0", 1);
+        tx2.send(()).unwrap();
+        while let Err(_) = rx.try_recv() {
+            rpc.progress();
+        }
+    });
+
+    let nx = Nexus::new(("127.0.0.1", cli_port));
+    let rpc = Rpc::new(&nx, 1, "mlx5_0", 1);
+
+    rx2.recv().unwrap();
+    let sess = rpc.create_session(("127.0.0.1", svr_port), 2);
+    assert!(block_on(sess.connect()));
+
+    // Prepare buffer.
+    let req_buf = rpc.alloc_msgbuf(50000);
+    let mut resp_buf = rpc.alloc_msgbuf(16);
+
+    // Send request.
+    unsafe { ptr::write_bytes(req_buf.as_ptr(), 0, req_buf.len()) };
+    let request = sess.request(RPC_HELLO, &req_buf, &mut resp_buf);
+    block_on(request);
+
+    // Validation.
+    let payload = {
+        let mut payload = Vec::with_capacity(resp_buf.len());
+        unsafe {
+            ptr::copy_nonoverlapping(resp_buf.as_ptr(), payload.as_mut_ptr(), resp_buf.len());
+            payload.set_len(resp_buf.len());
+        }
+        String::from_utf8(payload).unwrap()
+    };
+    assert_eq!(payload, HELLO_WORLD);
+
+    tx.send(()).unwrap();
+    handle.join().unwrap();
+}

@@ -72,22 +72,22 @@ pub(crate) enum PktType {
     SmallReq = 0,
 
     /// Control packet for a large request.
-    LargeReqCtrl = 1,
+    LargeReq = 1,
 
     /// Single-packet response.
     SmallResp = 2,
 
     /// Control packet for a large response.
-    LargeRespCtrl = 3,
+    LargeResp = 3,
 }
 
 impl From<u8> for PktType {
     fn from(val: u8) -> Self {
         match val {
             0 => Self::SmallReq,
-            1 => Self::LargeReqCtrl,
+            1 => Self::LargeReq,
             2 => Self::SmallResp,
-            3 => Self::LargeRespCtrl,
+            3 => Self::LargeResp,
 
             // SAFETY: only used by `PacketHeader::pkt_type()`, which will only
             // pass 2-bit values to this function.

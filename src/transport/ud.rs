@@ -11,12 +11,14 @@ use rrddmma::{
     },
 };
 
+use super::rc::ControlMsg;
 use crate::msgbuf::MsgBuf;
 use crate::pkthdr::PacketHeader;
 use crate::util::{huge_alloc::*, likely::*};
 
 /// Memory region handle type.
 pub type LKey = rrddmma::rdma::type_alias::LKey;
+pub type RKey = rrddmma::rdma::type_alias::RKey;
 
 /// An item to transmit.
 pub(crate) struct TxItem {
@@ -37,9 +39,15 @@ struct RxItem {
 }
 
 /// RDMA UD transport.
+/// Processes small messages and control packets of large messages.
+///
+/// While this type mainly serves UD transport, it also provides basic RDMA context
+/// support for the [`RcTransport`](super::rc::RcTransport).
 pub(crate) struct UdTransport {
     /// The UD queue pair.
     qp: Qp,
+    /// Local port information.
+    port: Port,
     /// Memory region registry.
     mrs: Vec<Mr>,
 
@@ -47,17 +55,17 @@ pub(crate) struct UdTransport {
     /// Used to check whether to signal a batch of send requests.
     tx_pkt_idx: usize,
     /// Send SGE buffer.
-    tx_sgl: Vec<ibv_sge>,
+    tx_sgl: Vec<[ibv_sge; 2]>,
     /// Send work request buffer.
     tx_wr: Vec<ibv_send_wr>,
 
     /// Recv memory buffer.
-    // Place after `mrs` to ensure that it is dropped after memory regions.
+    /// Place after `mrs` to ensure that it is dropped after memory regions.
     #[allow(unused)]
     rx_buf: HugeAlloc,
     /// Recv SGE buffer.
     #[allow(unused)]
-    rx_sge: Vec<ibv_sge>,
+    rx_sgl: Vec<ibv_sge>,
     /// Recv work request buffer.
     rx_wr: Vec<ibv_recv_wr>,
     /// Recv work completion buffer.
@@ -132,7 +140,7 @@ impl UdTransport {
             let send_cq =
                 Cq::new(&context, Self::SQ_SIZE as _).expect("failed to allocate UD send CQ");
             let recv_cq =
-                Cq::new(&context, Self::RQ_SIZE as _).expect("failed to allocate RC recv CQ");
+                Cq::new(&context, Self::RQ_SIZE as _).expect("failed to allocate UD recv CQ");
             let mut qp = Qp::builder()
                 .qp_type(QpType::Ud)
                 .send_cq(&send_cq)
@@ -140,9 +148,9 @@ impl UdTransport {
                 .caps(QpCaps {
                     max_send_wr: Self::SQ_SIZE as _,
                     max_recv_wr: Self::RQ_SIZE as _,
-                    max_send_sge: 1,
+                    max_send_sge: 2,
                     max_recv_sge: 1,
-                    ..QpCaps::default()
+                    ..Default::default()
                 })
                 .sq_sig_all(false)
                 .build(&pd)
@@ -153,11 +161,11 @@ impl UdTransport {
         };
 
         // Initialize send WRs.
-        let mut tx_sgl = vec![ibv_sge::default(); Self::SQ_SIGNAL_BATCH + 1];
+        let mut tx_sgl = vec![[ibv_sge::default(); 2]; Self::SQ_SIGNAL_BATCH + 1];
         let mut tx_wr = (0..(Self::SQ_SIGNAL_BATCH + 1))
             .map(|i| ibv_send_wr {
                 wr_id: i as _,
-                sg_list: &mut tx_sgl[i],
+                sg_list: tx_sgl[i].as_mut_ptr(),
                 num_sge: 1,
                 opcode: ibv_wr_opcode::IBV_WR_SEND,
                 ..unsafe { mem::zeroed() }
@@ -222,6 +230,7 @@ impl UdTransport {
 
         Self {
             qp,
+            port,
             mrs: vec![rx_mr],
 
             tx_pkt_idx: 0,
@@ -229,7 +238,7 @@ impl UdTransport {
             tx_wr,
 
             rx_buf,
-            rx_sge,
+            rx_sgl: rx_sge,
             rx_wr,
             rx_wc,
             rx_items,
@@ -251,12 +260,24 @@ impl UdTransport {
         Self::MAX_PKT_SIZE
     }
 
+    /// Return the RDMA context used by this transport instance.
+    pub fn pd(&self) -> &Pd {
+        self.qp.pd()
+    }
+
     /// Return serialized endpoint information representing the transport instance.
+    #[cold]
     pub fn endpoint(&self) -> QpEndpoint {
         self.qp.endpoint().unwrap()
     }
 
+    /// Return the port information that the UD QP is bound to.
+    pub fn port(&self) -> &Port {
+        &self.port
+    }
+
     /// Construct a peer from the given endpoint information.
+    #[cold]
     pub fn create_peer(&self, ep: QpEndpoint) -> QpPeer {
         self.qp
             .make_peer(&ep)
@@ -269,12 +290,13 @@ impl UdTransport {
     /// # Safety
     ///
     /// The memory region `[buf, buf + len)` must be valid for access.
-    pub unsafe fn reg_mem(&mut self, buf: *mut u8, len: usize) -> LKey {
+    #[cold]
+    pub unsafe fn reg_mem(&mut self, buf: *mut u8, len: usize) -> (LKey, RKey) {
         let mr = Mr::reg(self.qp.pd(), buf, len, Permission::default())
             .expect("failed to register memory region");
-        let lkey = mr.lkey();
+        let keys = (mr.lkey(), mr.rkey());
         self.mrs.push(mr);
-        lkey
+        keys
     }
 
     /// Transmit a batch of messages.
@@ -320,12 +342,32 @@ impl UdTransport {
 
             // Fill in the scatter/gather list.
             let msgbuf = &*item.msgbuf;
-            let length = msgbuf.pkt_len() as _;
-            *sge = ibv_sge {
-                addr: msgbuf.pkt_hdr() as _,
-                length,
-                lkey: msgbuf.lkey(),
-            };
+            let length: u32;
+
+            // Send header + data if small, header + control otherwise.
+            if likely(msgbuf.len() <= Self::max_data_in_pkt()) {
+                length = (mem::size_of::<PacketHeader>() + msgbuf.len()) as _;
+                sge[0] = ibv_sge {
+                    addr: msgbuf.pkt_hdr() as _,
+                    length,
+                    lkey: msgbuf.lkey(),
+                };
+                wr.num_sge = 1;
+            } else {
+                length = (mem::size_of::<PacketHeader>() + mem::size_of::<ControlMsg>()) as _;
+                sge[0] = ibv_sge {
+                    addr: msgbuf.pkt_hdr() as _,
+                    length: mem::size_of::<PacketHeader>() as _,
+                    lkey: msgbuf.lkey(),
+                };
+                sge[1] = ibv_sge {
+                    addr: msgbuf.ctrl_msg() as _,
+                    length: mem::size_of::<ControlMsg>() as _,
+                    lkey: msgbuf.lkey(),
+                };
+                wr.num_sge = 2;
+            }
+
             if length <= self.qp.caps().max_inline_data {
                 wr.send_flags |= ibv_send_flags::IBV_SEND_INLINE.0;
             }
@@ -383,9 +425,10 @@ impl UdTransport {
             .expect("failed to poll recv CQ") as usize;
         for i in 0..n {
             let wc = &self.rx_wc[i];
+            let byte_len = wc.ok().expect("failed to recv");
             self.rx_items.push_back(RxItem {
                 idx: wc.wr_id() as _,
-                len: wc.ok().expect("failed to recv") as _,
+                len: (byte_len - Self::GRH_SIZE - mem::size_of::<PacketHeader>()) as _,
             });
         }
         n
@@ -419,7 +462,7 @@ impl UdTransport {
         let i = self.rx_repost_pending;
 
         // SAFETY: in the same allocated buffer.
-        self.rx_sge[i].addr =
+        self.rx_sgl[i].addr =
             unsafe { self.rx_buf.ptr.add(Self::rx_offset(item.lkey() as _) as _) } as _;
         self.rx_wr[i].wr_id = item.lkey() as _;
         self.rx_repost_pending += 1;
