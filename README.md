@@ -11,6 +11,10 @@ Major features include:
 - Zero-copy
 - Automatically use RDMA UD for small messages and RC for large messages
 
+To use this library, you must have an available RDMA NIC installed on your computer.
+Mellanox's ConnectX adaptor series are the best;
+others should also work as long as you have `libibverbs` installed, but they are not tested.
+
 
 ## Unsoundness
 
