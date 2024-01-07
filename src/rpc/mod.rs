@@ -20,7 +20,7 @@ use rrddmma::rdma::qp::QpEndpoint;
 
 use self::pending::*;
 use crate::type_alias::*;
-use crate::util::{buddy::*, likely::*};
+use crate::util::{buddy::*, likely::*, thread_check::*};
 use crate::{handler::*, msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*};
 
 #[cfg(debug_assertions)]
@@ -78,6 +78,11 @@ impl RpcInterior {
 }
 
 /// Thread-local RPC endpoint.
+///
+/// This type is `Send + Sync` to make compiler happy, but it is actually not.
+/// You may not create or acquire sessions, allocate message buffers, or make
+/// progress from other threads except the one that created the `Rpc`. This is
+/// enforced at runtime and will panic if violated.
 pub struct Rpc {
     /// ID of this RPC instance.
     id: RpcId,
@@ -91,9 +96,6 @@ pub struct Rpc {
     pub(crate) sm_tx: UdpSocket,
     /// Session management event receiver.
     sm_rx: SmEventRx,
-
-    /// Cached transport endpoint information.
-    tp_ep: QpEndpoint,
 
     /// Interior-mutable state of this RPC.
     /// Depending on the build mode, this field is either the checked [`RefCell`]
@@ -110,6 +112,9 @@ pub struct Rpc {
     /// Pinning marker to prevent moving around.
     _pinned: PhantomPinned,
 }
+
+unsafe impl Send for Rpc {}
+unsafe impl Sync for Rpc {}
 
 /// A macro that handles response transmission logic.
 /// - `ENQUEUE`: normal response enqueue, after calling the handler.
@@ -1109,7 +1114,6 @@ impl Rpc {
 
             sm_tx: UdpSocket::bind("0.0.0.0:0").unwrap(),
             sm_rx,
-            tp_ep: tp.endpoint(),
             state: InteriorCell::new(RpcInterior {
                 sessions: Vec::new(),
                 allocator: BuddyAllocator::new(),
@@ -1135,12 +1139,6 @@ impl Rpc {
         &self.nexus
     }
 
-    /// Return the RDMA UD QP endpoint information of this `Rpc` instance.
-    #[inline(always)]
-    pub fn datagram_endpoint(&self) -> QpEndpoint {
-        self.tp_ep
-    }
-
     /// Create a client session that connects to a remote `Rpc` instance.
     ///
     /// The created session is not connected by default, and it will spend no
@@ -1155,6 +1153,8 @@ impl Rpc {
         remote_uri: impl ToSocketAddrs,
         remote_rpc_id: RpcId,
     ) -> SessionHandle {
+        do_thread_check(self);
+
         // Get the URI first so that we can panic early.
         let remote_uri = remote_uri
             .to_socket_addrs()
@@ -1162,6 +1162,7 @@ impl Rpc {
             .next()
             .expect("no such remote URI");
 
+        // Borrow the state, thread-unsafe.
         let mut real_state = self.state.borrow_mut();
         let state: &mut RpcInterior = &mut real_state;
 
@@ -1186,6 +1187,9 @@ impl Rpc {
 
     /// Return a handle to a session of the given ID.
     pub fn get_session(&self, sess_id: SessId) -> Option<SessionHandle> {
+        do_thread_check(self);
+
+        // Borrow the state, thread-unsafe.
         let state = self.state.borrow();
         if state.sessions.len() <= sess_id as usize {
             return None;
@@ -1213,6 +1217,7 @@ impl Rpc {
     /// Panic if buffer allocation fails.
     #[inline]
     pub fn alloc_msgbuf(&self, len: usize) -> MsgBuf {
+        do_thread_check(self);
         self.state.borrow_mut().alloc_msgbuf(len)
     }
 
@@ -1223,6 +1228,8 @@ impl Rpc {
     /// - scheduling and (re)transmitting datapath packets.
     #[inline]
     pub fn progress(&self) {
+        do_thread_check(self);
+
         // Prevent reentrance of this method.
         let Ok(_flag) = self.progressing.try_borrow_mut() else {
             return;
