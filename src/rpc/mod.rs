@@ -355,6 +355,7 @@ impl Rpc {
     /// # Panics
     ///
     /// Panic if `self.state` is already borrowed.
+    #[allow(dropping_references)]
     fn process_large_request_body(&self, sess_id: SessId, sslot_idx: usize) {
         let state = self.state.borrow();
         let sess = &state.sessions[sess_id as usize];

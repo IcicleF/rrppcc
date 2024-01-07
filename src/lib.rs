@@ -1,6 +1,6 @@
 //! # rrppcc
 //!
-#![cfg_attr(not(doctest), doc = include_str!("../README.md"))]
+#![doc = include_str!("../README.md")]
 //!
 //! ## Example
 //!
@@ -8,7 +8,7 @@
 //! from the client to the server. It assumes that the UDP port 31850 and 31851 can
 //! be used.
 //!
-//! ```rust
+//! ```rust,no_run
 #![doc = include_str!("../examples/hello.rs")]
 //! ```
 
