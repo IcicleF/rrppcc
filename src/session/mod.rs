@@ -29,6 +29,9 @@ pub(crate) struct PendingRequest {
 
     /// Expected request index, only for correctness check.
     pub expected_req_idx: ReqIdx,
+
+    /// Aborted flag.
+    pub aborted: bool,
 }
 
 pub(crate) const ACTIVE_REQ_WINDOW: usize = 8;

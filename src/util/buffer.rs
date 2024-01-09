@@ -1,4 +1,5 @@
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
+use std::rc::Rc;
 
 use crate::transport::{LKey, RKey};
 use crate::util::buddy::*;
@@ -17,25 +18,21 @@ pub(crate) struct Buffer {
     rkey: RKey,
 
     /// Pointer to the buddy allocator.
-    owner: *mut BuddyAllocator,
+    owner: Option<Rc<BuddyAllocator>>,
 }
 
 impl Buffer {
     /// A real buffer that will be deallocated when dropped.
+    ///
+    /// This constructor does not set `owner`. Use `set_owner` to set it.
     #[inline]
-    pub fn real(
-        owner: *mut BuddyAllocator,
-        buf: NonNull<u8>,
-        len: usize,
-        lkey: LKey,
-        rkey: RKey,
-    ) -> Self {
+    pub fn real(buf: NonNull<u8>, len: usize, lkey: LKey, rkey: RKey) -> Self {
         Self {
             buf,
             len,
             lkey,
             rkey,
-            owner,
+            owner: None,
         }
     }
 
@@ -47,7 +44,7 @@ impl Buffer {
             len: 0,
             lkey,
             rkey,
-            owner: ptr::null_mut(),
+            owner: None,
         }
     }
 
@@ -74,14 +71,18 @@ impl Buffer {
     pub fn rkey(&self) -> RKey {
         self.rkey
     }
+
+    /// Set the owner of the buffer.
+    #[inline(always)]
+    pub fn set_owner(&mut self, owner: &Rc<BuddyAllocator>) {
+        self.owner = Some(owner.clone());
+    }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        if let Some(owner) = NonNull::new(self.owner) {
-            // Return the buffer to the allocator.
-            // SAFETY: if the owner is not null, it must point to a valid BuddyAllocator.
-            unsafe { BuddyAllocator::free_by_ptr(owner, self) };
+        if let Some(ref owner) = self.owner {
+            owner.free(self);
         }
     }
 }

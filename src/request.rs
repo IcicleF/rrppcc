@@ -10,7 +10,7 @@ use quanta::Instant;
 use crate::msgbuf::MsgBuf;
 use crate::rpc::Rpc;
 use crate::type_alias::*;
-use crate::util::thread_check::do_thread_check;
+use crate::util::{likely::*, thread_check::*};
 
 /// An awaitable object that represents an incompleted RPC request.
 ///
@@ -32,12 +32,8 @@ pub struct Request<'a> {
     /// Request index.
     req_idx: ReqIdx,
 
-    /// Request start time.
+    /// Time of the last transmission of the request.
     start_time: Instant,
-
-    /// Indicates whether this request has been aborted.
-    /// If `true`, polling this request will always return `Poll::Pending`.
-    aborted: bool,
 }
 
 unsafe impl Send for Request<'_> {}
@@ -60,7 +56,6 @@ impl<'a> Request<'a> {
             sslot_idx,
             req_idx,
             start_time: Instant::recent(),
-            aborted: false,
         }
     }
 }
@@ -68,6 +63,19 @@ impl<'a> Request<'a> {
 impl Request<'_> {
     /// Retransmit the request if the response is not received within 20ms.
     pub const RETX_TIMEOUT: Duration = Duration::from_millis(20);
+
+    /// Immediately abort the request, no matter whether it has completed or not.
+    /// If the request has not finished, the response will be discarded in the future.
+    /// Consume the request object, so that further polling is impossible.
+    ///
+    /// If the request is in the pending queue and not even started, aborting it leads
+    /// to a traversal of the pending queue, which is not very efficient.
+    #[inline]
+    pub fn abort(self) {
+        do_thread_check(self.rpc);
+        self.rpc
+            .abort_request((self.sess_id, self.sslot_idx, self.req_idx));
+    }
 }
 
 impl<'a> Future for Request<'a> {
@@ -75,11 +83,6 @@ impl<'a> Future for Request<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         do_thread_check(self.rpc);
-
-        // If the request has been aborted, always return `Poll::Pending`.
-        if self.aborted {
-            return Poll::Pending;
-        }
 
         // If the request has finished, return the response.
         let need_re_tx = Instant::recent() - self.start_time > Self::RETX_TIMEOUT;
@@ -89,6 +92,9 @@ impl<'a> Future for Request<'a> {
             need_re_tx,
         ) {
             return Poll::Ready(());
+        }
+        if unlikely(need_re_tx) {
+            self.start_time = Instant::recent();
         }
 
         // Otherwise, try to make some progress.

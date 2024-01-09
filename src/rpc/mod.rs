@@ -8,6 +8,7 @@ use std::net::ToSocketAddrs;
 use std::net::UdpSocket;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread::{self, ThreadId};
@@ -48,7 +49,7 @@ pub(crate) struct RpcInterior {
 
     /// Buffer allocator.
     /// This need to be the last one to drop.
-    allocator: BuddyAllocator,
+    allocator: Rc<BuddyAllocator>,
 }
 
 impl RpcInterior {
@@ -869,6 +870,54 @@ impl Rpc {
     }
 }
 
+/// A macro that prepares a `SSlot` for the next request.
+///
+/// This is a macro instead of a method becuase the latter will make the borrow
+/// checker very unhappy.
+macro_rules! do_sslot_move_next {
+    ($state:ident, $sess:ident, $sslot:ident, $sslot_idx:ident) => {
+        // Move the SSlot to  the next request.
+        $sslot.req_idx += ACTIVE_REQ_WINDOW as ReqIdx;
+        $sslot.finished = false;
+
+        // Find the next pending request, if there are any.
+        let pending_req = if unlikely(!$sess.req_backlog[$sslot_idx].is_empty()) {
+            let mut ret = None;
+            while let Some(req) = $sess.req_backlog[$sslot_idx].pop_front() {
+                if likely(!req.aborted) {
+                    ret = Some(req);
+                    break;
+                }
+            }
+            ret
+        } else {
+            None
+        };
+
+        // If there exist a pending request, reuse the `SSlot` and start transmission.
+        if let Some(pending_req) = pending_req {
+            assert!(
+                pending_req.expected_req_idx == $sslot.req_idx,
+                "mismatch req_idx for pending request: expected {}, got {}",
+                pending_req.expected_req_idx,
+                $sslot.req_idx
+            );
+            $sslot.req = pending_req.req;
+            $sslot.resp = pending_req.resp;
+
+            // Packet header should have been prepared when enqueueing the request,
+            // so just push the packet into the Tx queue.
+            $state.pending_tx.push(TxItem {
+                peer: $sess.peer.as_ref().unwrap(),
+                msgbuf: &$sslot.req,
+            });
+        } else {
+            // Free the SSlot.
+            $sess.avail_slots.push_back($sslot_idx);
+        }
+    };
+}
+
 // Crate-internal API.
 impl Rpc {
     /// Return `true` if the session of the given ID exists and is connected.
@@ -997,6 +1046,7 @@ impl Rpc {
                 req: req_msgbuf.clone_borrowed(),
                 resp: resp_msgbuf.clone_borrowed(),
                 expected_req_idx: req_idx,
+                aborted: false,
             });
 
             Request::new(self, resp_msgbuf, sess_id, sslot_idx, req_idx)
@@ -1046,33 +1096,7 @@ impl Rpc {
             // Modify user-provided response buffer length.
             resp_buf.set_len(sslot.resp.len());
 
-            // Move the SSlot to  the next request.
-            sslot.req_idx += ACTIVE_REQ_WINDOW as ReqIdx;
-
-            // Make a pending request active, if there is any.
-            if let Some(pending_req) = sess.req_backlog[sslot_idx].pop_front() {
-                // Reuse the same SSlot.
-                assert!(
-                    pending_req.expected_req_idx == sslot.req_idx,
-                    "mismatch req_idx for pending request: expected {}, got {}",
-                    pending_req.expected_req_idx,
-                    sslot.req_idx
-                );
-                sslot.finished = false;
-                sslot.req = pending_req.req;
-                sslot.resp = pending_req.resp;
-
-                // Packet header should have been prepared when enqueueing the request,
-                // so just push the packet into the Tx queue.
-                state.pending_tx.push(TxItem {
-                    peer: sess.peer.as_ref().unwrap(),
-                    msgbuf: &sslot.req,
-                });
-            } else {
-                // Free the SSlot.
-                sess.avail_slots.push_back(sslot_idx);
-            }
-
+            do_sslot_move_next!(state, sess, sslot, sslot_idx);
             return true;
         }
 
@@ -1084,6 +1108,32 @@ impl Rpc {
             });
         }
         false
+    }
+
+    /// Abort a request.
+    pub(crate) fn abort_request(&self, (sess_id, sslot_idx, req_idx): (SessId, usize, ReqIdx)) {
+        let mut real_state = self.state.borrow_mut();
+        let state: &mut RpcInterior = &mut real_state;
+
+        let sess = &mut state.sessions[sess_id as usize];
+        let sslot = &mut sess.slots[sslot_idx];
+
+        // Request has already expired, so aborting it is no-op.
+        if unlikely(sslot.req_idx > req_idx) {
+            return;
+        }
+
+        if likely(sslot.req_idx == req_idx) {
+            // Request is in `SSlot`, similar to request completion.
+            do_sslot_move_next!(state, sess, sslot, sslot_idx);
+        } else {
+            // Request is in the pending queue, make it aborted.
+            let pending_req = sess.req_backlog[sslot_idx]
+                .iter_mut()
+                .find(|pending_req| pending_req.expected_req_idx == req_idx)
+                .unwrap();
+            pending_req.aborted = true;
+        }
     }
 }
 
@@ -1116,7 +1166,7 @@ impl Rpc {
             sm_rx,
             state: InteriorCell::new(RpcInterior {
                 sessions: Vec::new(),
-                allocator: BuddyAllocator::new(),
+                allocator: Rc::new(BuddyAllocator::new()),
                 rc_tp: RcTransport::new(&tp),
                 tp,
                 pending_handlers: Vec::with_capacity(PREALLOC_SIZE),

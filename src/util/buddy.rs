@@ -1,5 +1,11 @@
-use std::cell::UnsafeCell;
 use std::ptr::NonNull;
+use std::rc::Rc;
+
+#[cfg(debug_assertions)]
+use std::cell::RefCell as InteriorCell;
+
+#[cfg(not(debug_assertions))]
+use crate::util::unsafe_refcell::UnsafeRefCell as InteriorCell;
 
 use crate::transport::{LKey, RKey, UdTransport};
 use crate::util::{buffer::*, huge_alloc::*};
@@ -150,18 +156,12 @@ impl BuddyAllocatorInner {
             debug_assert!(!self.buddy[class].is_empty());
         }
         let buf = self.buddy[class].pop().unwrap();
-        Buffer::real(
-            self as *mut _ as _,
-            buf.buf,
-            Self::size_of_class(class),
-            buf.lkey,
-            buf.rkey,
-        )
+        Buffer::real(buf.buf, Self::size_of_class(class), buf.lkey, buf.rkey)
     }
 
     /// Free a buffer.
     /// This does not actually free the memory, but returns it to the buddy allocator.
-    fn free(&mut self, buf: &mut Buffer) {
+    fn free(&mut self, buf: &Buffer) {
         let class = Self::class_of(buf.len());
         self.buddy[class].push(InBuddyBuffer::new(
             // SAFETY: `buf.as_ptr()` returns the raw pointer stored in `NonNull`.
@@ -175,7 +175,7 @@ impl BuddyAllocatorInner {
 /// The buddy allocator that never combines buddies.
 #[repr(transparent)]
 pub(crate) struct BuddyAllocator {
-    inner: UnsafeCell<BuddyAllocatorInner>,
+    inner: InteriorCell<BuddyAllocatorInner>,
 }
 
 impl BuddyAllocator {
@@ -185,26 +185,20 @@ impl BuddyAllocator {
     /// Create a new buddy allocator with no pre-allocation.
     pub fn new() -> Self {
         Self {
-            inner: UnsafeCell::new(BuddyAllocatorInner::new()),
+            inner: InteriorCell::new(BuddyAllocatorInner::new()),
         }
     }
 
     /// Allocate a new buffer with at least the given length.
-    pub fn alloc(&mut self, len: usize, tp: &mut UdTransport) -> Buffer {
-        self.inner.get_mut().alloc(len, tp)
+    pub fn alloc(self: &Rc<Self>, len: usize, tp: &mut UdTransport) -> Buffer {
+        let mut buf = self.inner.borrow_mut().alloc(len, tp);
+        buf.set_owner(self);
+        buf
     }
 
     /// Free a buffer.
     /// This does not actually free the memory, but returns it to the buddy allocator.
-    pub fn free(&mut self, buf: &mut Buffer) {
-        self.inner.get_mut().free(buf)
-    }
-}
-
-impl BuddyAllocator {
-    /// Free a buffer with a `*mut Self` pointer.
-    /// This does not actually free the memory, but returns it to the buddy allocator.
-    pub unsafe fn free_by_ptr(mut this: NonNull<Self>, buf: &mut Buffer) {
-        this.as_mut().free(buf)
+    pub fn free(self: &Rc<Self>, buf: &Buffer) {
+        self.inner.borrow_mut().free(buf)
     }
 }
