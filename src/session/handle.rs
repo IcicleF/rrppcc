@@ -13,6 +13,7 @@ use crate::type_alias::*;
 use crate::util::{likely::*, thread_check::*};
 
 /// Handle to a session that points to a specific remote `Rpc` endpoint.
+#[derive(Clone, Copy)]
 pub struct SessionHandle<'r> {
     /// The RPC instance that owns this session.
     rpc: &'r Rpc,
