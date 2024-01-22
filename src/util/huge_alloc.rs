@@ -36,7 +36,7 @@ impl Drop for HugeAlloc {
 #[inline]
 fn alloc_mmap(len: usize, flags: i32) -> *mut u8 {
     // SAFETY: FFI.
-    unsafe {
+    let ret = unsafe {
         mmap(
             ptr::null_mut(),
             len,
@@ -45,6 +45,12 @@ fn alloc_mmap(len: usize, flags: i32) -> *mut u8 {
             -1,
             0,
         ) as *mut u8
+    };
+
+    if ret != MAP_FAILED as _ {
+        ret
+    } else {
+        ptr::null_mut()
     }
 }
 
@@ -67,7 +73,7 @@ pub(crate) fn alloc_raw(len: usize) -> HugeAlloc {
 
     // 1. Try to allocate huge page.
     let ptr = alloc_mmap(len, MAP_HUGETLB);
-    if likely(!ptr.is_null()) {
+    if !ptr.is_null() {
         return HugeAlloc {
             ptr,
             len,

@@ -132,7 +132,13 @@ impl Nexus {
             .expect("failed to resolve remote URI")
             .next()
             .expect("no such remote URI");
-        let socket = UdpSocket::bind(uri).unwrap();
+
+        // Bind to 0.0.0.0 or ::0, depending on the type of `uri`.
+        let unspecified = match uri {
+            SocketAddr::V4(_) => "0.0.0.0",
+            SocketAddr::V6(_) => "::0",
+        };
+        let socket = UdpSocket::bind((unspecified, uri.port())).unwrap();
 
         const SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(100);
         socket.set_read_timeout(Some(SOCKET_READ_TIMEOUT)).unwrap();
