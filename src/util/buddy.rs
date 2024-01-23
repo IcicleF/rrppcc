@@ -49,7 +49,6 @@ impl InBuddyBuffer {
 
 /// The true buddy allocator, but it cannot be directly exposed to the crate
 /// since there are pointer-based accesses triggered by dropping a `MsgBuf`.
-///
 struct BuddyAllocatorInner {
     /// Buddy system.
     buddy: [Vec<InBuddyBuffer>; Self::NUM_CLASSES],
@@ -124,7 +123,7 @@ impl BuddyAllocatorInner {
 
 impl BuddyAllocatorInner {
     /// Create a new buddy allocator with no pre-allocation.
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buddy: Default::default(),
             mem_registry: Vec::new(),
@@ -133,7 +132,12 @@ impl BuddyAllocatorInner {
     }
 
     /// Allocate a new buffer with at least the given length.
-    fn alloc(&mut self, len: usize, tp: &mut UdTransport) -> Buffer {
+    pub fn alloc(
+        &mut self,
+        len: usize,
+        tp: &mut UdTransport,
+        owner: &Rc<BuddyAllocator>,
+    ) -> Buffer {
         assert!(
             len <= Self::MAX_ALLOC_SIZE,
             "requested buffer too large (maximum: {}MB)",
@@ -156,12 +160,18 @@ impl BuddyAllocatorInner {
             debug_assert!(!self.buddy[class].is_empty());
         }
         let buf = self.buddy[class].pop().unwrap();
-        Buffer::real(buf.buf, Self::size_of_class(class), buf.lkey, buf.rkey)
+        Buffer::real(
+            buf.buf,
+            Self::size_of_class(class),
+            buf.lkey,
+            buf.rkey,
+            Some(owner.clone()),
+        )
     }
 
     /// Free a buffer.
     /// This does not actually free the memory, but returns it to the buddy allocator.
-    fn free(&mut self, buf: &Buffer) {
+    pub fn free(&mut self, buf: &Buffer) {
         let class = Self::class_of(buf.len());
         self.buddy[class].push(InBuddyBuffer::new(
             // SAFETY: `buf.as_ptr()` returns the raw pointer stored in `NonNull`.
@@ -172,7 +182,7 @@ impl BuddyAllocatorInner {
     }
 }
 
-/// The buddy allocator that never combines buddies.
+/// A buddy allocator that never combines buddies.
 #[repr(transparent)]
 pub(crate) struct BuddyAllocator {
     inner: InteriorCell<BuddyAllocatorInner>,
@@ -191,9 +201,7 @@ impl BuddyAllocator {
 
     /// Allocate a new buffer with at least the given length.
     pub fn alloc(self: &Rc<Self>, len: usize, tp: &mut UdTransport) -> Buffer {
-        let mut buf = self.inner.borrow_mut().alloc(len, tp);
-        buf.set_owner(self);
-        buf
+        self.inner.borrow_mut().alloc(len, tp, self)
     }
 
     /// Free a buffer.

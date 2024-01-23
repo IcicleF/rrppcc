@@ -21,7 +21,7 @@ use rrddmma::rdma::qp::QpEndpoint;
 
 use self::pending::*;
 use crate::type_alias::*;
-use crate::util::{buddy::*, likely::*, thread_check::*};
+use crate::util::{buddy::*, likely::*, slab::*, thread_check::*};
 use crate::{handler::*, msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*};
 
 #[cfg(debug_assertions)]
@@ -46,6 +46,9 @@ pub(crate) struct RpcInterior {
 
     /// Pending packet transmissions.
     pending_tx: Vec<TxItem>,
+
+    /// SSlot PacketHeader allocator.
+    slab: SlabAllocator<PacketHeader>,
 
     /// Buffer allocator.
     /// This need to be the last one to drop.
@@ -75,6 +78,14 @@ impl RpcInterior {
         let buf_len = MsgBuf::buf_len(len);
         let buf = self.allocator.alloc(buf_len, &mut self.tp);
         MsgBuf::owned(buf, len)
+    }
+
+    /// Allocate a `MsgBuf` for a packet header.
+    #[inline]
+    pub fn alloc_pkthdr_buf(&mut self) -> MsgBuf {
+        let buf = self.slab.alloc(&mut self.tp);
+        debug_assert!((buf.as_ptr() as usize) % mem::align_of::<PacketHeader>() == 0);
+        MsgBuf::owned(buf, mem::size_of::<PacketHeader>())
     }
 }
 
@@ -127,10 +138,9 @@ unsafe impl Sync for Rpc {}
 macro_rules! do_response_tx {
     (ENQUEUE, $state:ident, $sess:ident, $sslot:ident, $resp:ident) => {
         // Write the packet header of the response MsgBuf.
-        // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
         unsafe {
             ptr::write_volatile(
-                $resp.pkt_hdr(),
+                $sslot.pkthdr.as_ptr() as *mut PacketHeader,
                 PacketHeader::new(
                     $sslot.req_type,
                     $resp.len() as _,
@@ -153,6 +163,7 @@ macro_rules! do_response_tx {
         // Push the packet to the pending TX queue.
         $state.pending_tx.push(TxItem {
             peer: $sess.peer.as_ref().unwrap(),
+            pkthdr: &$sslot.pkthdr,
             msgbuf: &$sslot.resp,
         });
     };
@@ -181,6 +192,7 @@ macro_rules! do_response_tx {
                 // Setup retransmission item.
                 $state.pending_tx.push(TxItem {
                     peer: $sess.peer.as_ref().unwrap(),
+                    pkthdr: &$sslot.pkthdr,
                     msgbuf: &$sslot.resp,
                 });
 
@@ -219,18 +231,18 @@ impl Rpc {
         &self,
         sess_id: SessId,
         sslot_idx: usize,
+        pkthdr: &PacketHeader,
         req_msgbuf: &MsgBuf,
     ) -> bool {
         // SAFETY: guaranteed not null and aligned.
-        let hdr = unsafe { NonNull::new_unchecked(req_msgbuf.pkt_hdr()).as_mut() };
         debug_assert_eq!(
-            hdr.pkt_type(),
+            pkthdr.pkt_type(),
             PktType::SmallReq,
             "packet type is not small-request"
         );
 
         // Check request type sanity.
-        let req_type = hdr.req_type();
+        let req_type = pkthdr.req_type();
         if unlikely(!self.nexus.has_rpc_handler(req_type)) {
             log::debug!(
                 "RPC {}: dropping received SmallReq for unknown request type {:?}",
@@ -246,7 +258,7 @@ impl Rpc {
         let sslot = &mut sess.slots[sslot_idx];
 
         // Check request index sanity.
-        let req_idx = hdr.req_idx();
+        let req_idx = pkthdr.req_idx();
         if unlikely(req_idx <= sslot.req_idx) {
             do_response_tx!(RETRANSMIT, self.id, state, sess, sslot, req_idx, req_type);
             return true;
@@ -669,8 +681,9 @@ impl Rpc {
         for _ in 0..n {
             let item = state.tp.rx_next().expect("failed to fetch received packet");
 
-            // SAFETY: guaranteed not null and aligned.
-            let hdr = unsafe { NonNull::new_unchecked(item.pkt_hdr()).as_mut() };
+            // SAFETY: this is a transport receive buffer, so we can call `pkt_hdr()` to get the header.
+            // Pointers are guaranteed not null and aligned.
+            let hdr = unsafe { NonNull::new_unchecked(item.pkt_hdr()).as_ref() };
             let sess_id = hdr.dst_sess_id();
             if unlikely(state.sessions.len() <= sess_id as usize) {
                 log::debug!(
@@ -790,12 +803,13 @@ impl Rpc {
 
         // ... so that we can start to handle requests.
         for item in rx_requests {
-            // SAFETY: guaranteed not null and aligned.
-            let hdr = unsafe { NonNull::new_unchecked(item.pkt_hdr()).as_mut() };
+            // SAFETY: this is a transport receive buffer, so we can call `pkt_hdr()` to get the header.
+            // Pointers are guaranteed not null and aligned.
+            let hdr = unsafe { NonNull::new_unchecked(item.pkt_hdr()).as_ref() };
             let sess_id = hdr.dst_sess_id();
             let sslot_idx = hdr.req_idx() as usize % ACTIVE_REQ_WINDOW;
 
-            if self.process_small_request(sess_id, sslot_idx, &item) {
+            if self.process_small_request(sess_id, sslot_idx, hdr, &item) {
                 rx_bufs_to_release.push(item);
             }
         }
@@ -901,7 +915,7 @@ macro_rules! do_sslot_move_next {
 
         // If there exist a pending request, reuse the `SSlot` and start transmission.
         if let Some(pending_req) = pending_req {
-            assert!(
+            debug_assert!(
                 pending_req.expected_req_idx == $sslot.req_idx,
                 "mismatch req_idx for pending request: expected {}, got {}",
                 pending_req.expected_req_idx,
@@ -910,10 +924,20 @@ macro_rules! do_sslot_move_next {
             $sslot.req = pending_req.req;
             $sslot.resp = pending_req.resp;
 
-            // Packet header should have been prepared when enqueueing the request,
-            // so just push the packet into the Tx queue.
+            // Fill in the request packet header.
+            // SAFETY: packet header validity checked on creation.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    &pending_req.pkthdr,
+                    $sslot.pkthdr.as_ptr() as *mut PacketHeader,
+                    1,
+                )
+            };
+
+            // Push the packet into the Tx queue.
             $state.pending_tx.push(TxItem {
                 peer: $sess.peer.as_ref().unwrap(),
+                pkthdr: &$sslot.pkthdr,
                 msgbuf: &$sslot.req,
             });
         } else {
@@ -988,10 +1012,10 @@ impl Rpc {
             sslot.resp = resp_msgbuf.clone_borrowed();
 
             // Fill in the request packet header.
-            // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
+            // SAFETY: packet header validity checked on creation.
             unsafe {
                 ptr::write_volatile(
-                    req_msgbuf.pkt_hdr(),
+                    sslot.pkthdr.as_ptr() as *mut PacketHeader,
                     PacketHeader::new(
                         req_type,
                         req_msgbuf.len() as _,
@@ -1009,6 +1033,7 @@ impl Rpc {
             // Push the request into the Tx queue.
             state.pending_tx.push(TxItem {
                 peer: sess.peer.as_ref().unwrap(),
+                pkthdr: &sslot.pkthdr,
                 msgbuf: &sslot.req,
             });
 
@@ -1028,27 +1053,22 @@ impl Rpc {
             let req_idx =
                 sess.slots[sslot_idx].req_idx + ((pending_len + 1) * ACTIVE_REQ_WINDOW) as ReqIdx;
 
-            // Fill in the packet header.
-            // SAFETY: `MsgBuf::pkt_hdr()` ensures buffer validity.
-            unsafe {
-                ptr::write_volatile(
-                    req_msgbuf.pkt_hdr(),
-                    PacketHeader::new(
-                        req_type,
-                        req_msgbuf.len() as _,
-                        sess.peer_sess_id,
-                        req_idx,
-                        if req_msgbuf.is_small() {
-                            PktType::SmallReq
-                        } else {
-                            PktType::LargeReq
-                        },
-                    ),
-                )
-            };
+            // Generate the packet header.
+            let pkthdr = PacketHeader::new(
+                req_type,
+                req_msgbuf.len() as _,
+                sess.peer_sess_id,
+                req_idx,
+                if likely(req_msgbuf.is_small()) {
+                    PktType::SmallReq
+                } else {
+                    PktType::LargeReq
+                },
+            );
 
             // Push the request into the pending queue.
             sess.req_backlog[sslot_idx].push_back(PendingRequest {
+                pkthdr,
                 req: req_msgbuf.clone_borrowed(),
                 resp: resp_msgbuf.clone_borrowed(),
                 expected_req_idx: req_idx,
@@ -1115,6 +1135,7 @@ impl Rpc {
         if unlikely(re_tx) {
             state.pending_tx.push(TxItem {
                 peer: sess.peer.as_ref().unwrap(),
+                pkthdr: &sslot.pkthdr,
                 msgbuf: &sslot.req,
             });
         }
@@ -1177,11 +1198,12 @@ impl Rpc {
             sm_rx,
             state: InteriorCell::new(RpcInterior {
                 sessions: Vec::new(),
-                allocator: Rc::new(BuddyAllocator::new()),
                 rc_tp: RcTransport::new(&tp),
                 tp,
                 pending_handlers: Vec::with_capacity(PREALLOC_SIZE),
                 pending_tx: Vec::with_capacity(PREALLOC_SIZE),
+                slab: SlabAllocator::new(),
+                allocator: Rc::new(BuddyAllocator::new()),
             }),
             progressing: RefCell::new(()),
             _pinned: PhantomPinned,

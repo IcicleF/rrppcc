@@ -11,6 +11,7 @@ use rrddmma::rdma::qp::{Qp, QpPeer};
 pub use self::handle::*;
 pub(crate) use self::sslot::*;
 use crate::msgbuf::MsgBuf;
+use crate::pkthdr::PacketHeader;
 use crate::rpc::RpcInterior;
 use crate::type_alias::*;
 
@@ -21,6 +22,9 @@ pub(crate) enum SessionRole {
 }
 
 pub(crate) struct PendingRequest {
+    /// Request PacketHeader.
+    pub pkthdr: PacketHeader,
+
     /// Request MsgBuf.
     pub req: MsgBuf,
 
@@ -63,7 +67,7 @@ pub(crate) struct Session {
     pub avail_slots: VecDeque<usize>,
     /// Queue for requests that are waiting for credits.
     ///
-    /// FIXME: the [`Request`] type records the `SSlot` index, which requires the
+    /// FIXME?: the [`Request`] type records the `SSlot` index, which requires the
     /// `SSlot` of a request to be determined immediately. However, for requests
     /// in the backlog queue, the `SSlot` is not determined until the request is
     /// dequeued. Therefore, we must maintain a separate queue for each SSlot.

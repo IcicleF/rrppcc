@@ -25,6 +25,9 @@ pub(crate) struct TxItem {
     /// Peer for this packet.
     pub peer: *const QpPeer,
 
+    /// Packet header.
+    pub pkthdr: *const MsgBuf,
+
     /// Message buffer.
     pub msgbuf: *const MsgBuf,
 }
@@ -166,7 +169,7 @@ impl UdTransport {
             .map(|i| ibv_send_wr {
                 wr_id: i as _,
                 sg_list: tx_sgl[i].as_mut_ptr(),
-                num_sge: 1,
+                num_sge: 2,
                 opcode: ibv_wr_opcode::IBV_WR_SEND,
                 ..unsafe { mem::zeroed() }
             })
@@ -328,9 +331,10 @@ impl UdTransport {
         // Now we are sure that the batch size is within the `SQ_SIGNAL_BATCH` limit.
         for (i, item) in items.iter().enumerate() {
             // SAFETY: the caller ensures that memory handles are valid.
-            let sge = &mut self.tx_sgl[i];
+            let sgl = &mut self.tx_sgl[i];
             let wr = &mut self.tx_wr[i];
-            debug_assert_eq!(wr.sg_list, sge as *mut _);
+            debug_assert_eq!(wr.sg_list, sgl as *mut _);
+            debug_assert_eq!(wr.num_sge, 2);
 
             // Set signaled flag + poll send CQ if needed.
             wr.send_flags = if self.tx_pkt_idx % Self::SQ_SIGNAL_BATCH == 0 {
@@ -344,31 +348,32 @@ impl UdTransport {
             self.tx_pkt_idx += 1;
 
             // Fill in the scatter/gather list.
-            let msgbuf = &*item.msgbuf;
-            let length: u32;
+            let mut length = mem::size_of::<PacketHeader>() as u32;
 
-            // Send header + data (contiguous) if small, header + control otherwise.
+            // 1. Packet header.
+            let pkthdr = &*item.pkthdr;
+            sgl[0] = ibv_sge {
+                addr: pkthdr.as_ptr() as _,
+                length: mem::size_of::<PacketHeader>() as _,
+                lkey: pkthdr.lkey(),
+            };
+
+            // 2. Payload: data if small, control otherwise.
+            let msgbuf = &*item.msgbuf;
             if likely(msgbuf.is_small()) {
-                length = (mem::size_of::<PacketHeader>() + msgbuf.len()) as _;
-                sge[0] = ibv_sge {
-                    addr: msgbuf.pkt_hdr() as _,
-                    length,
+                length += msgbuf.len() as u32;
+                sgl[1] = ibv_sge {
+                    addr: msgbuf.as_ptr() as _,
+                    length: msgbuf.len() as _,
                     lkey: msgbuf.lkey(),
                 };
-                wr.num_sge = 1;
             } else {
-                length = (mem::size_of::<PacketHeader>() + mem::size_of::<ControlMsg>()) as _;
-                sge[0] = ibv_sge {
-                    addr: msgbuf.pkt_hdr() as _,
-                    length: mem::size_of::<PacketHeader>() as _,
-                    lkey: msgbuf.lkey(),
-                };
-                sge[1] = ibv_sge {
+                length += mem::size_of::<ControlMsg>() as u32;
+                sgl[1] = ibv_sge {
                     addr: msgbuf.ctrl_msg() as _,
                     length: mem::size_of::<ControlMsg>() as _,
                     lkey: msgbuf.lkey(),
                 };
-                wr.num_sge = 2;
             }
 
             if length <= self.qp.caps().max_inline_data {
@@ -440,13 +445,15 @@ impl UdTransport {
         let offset = Self::rx_payload_offset(idx as _);
 
         // SAFETY: pointer guaranteed not-null, and within the same allocated buffer.
-        let buf = unsafe { NonNull::new_unchecked(self.rx_buf.ptr.add(offset) as *mut _) };
+        let data = unsafe {
+            NonNull::new_unchecked(
+                self.rx_buf.ptr.add(offset + mem::size_of::<PacketHeader>()) as *mut _
+            )
+        };
 
         // Embed the index into the unused `lkey` so that we do not need to perform division
         // to recover it from the pointer during release.
-        // SAFETY: the recv buffer layout ensures the buffer's validity.
-        let msgbuf = unsafe { MsgBuf::borrowed(buf, len as _, idx as _) };
-        Some(msgbuf)
+        Some(MsgBuf::borrowed(data, len as _, idx as _))
     }
 
     /// Mark a received message as released and can be reused.

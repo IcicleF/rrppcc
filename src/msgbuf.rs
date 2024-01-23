@@ -2,7 +2,7 @@ use std::mem::{self, MaybeUninit};
 use std::ptr::NonNull;
 use std::{ptr, slice};
 
-use crate::pkthdr::*;
+use crate::pkthdr::PacketHeader;
 use crate::transport::{ControlMsg, LKey, RKey, UdTransport};
 use crate::util::{buddy::BuddyAllocator, buffer::*, likely::*};
 
@@ -30,8 +30,7 @@ unsafe impl Sync for MsgBuf {}
 
 impl MsgBuf {
     /// Maximum application data bytes in a single `MsgBuf`.
-    pub const MAX_DATA_LEN: usize =
-        BuddyAllocator::MAX_ALLOC_SIZE - mem::size_of::<PacketHeader>() - 64;
+    pub const MAX_DATA_LEN: usize = BuddyAllocator::MAX_ALLOC_SIZE - 64;
 
     /// Return the needed buffer size for the given data length.
     #[inline(always)]
@@ -39,15 +38,12 @@ impl MsgBuf {
         // Roundup data length to multiplicity of 8.
         let max_len = data_len.next_multiple_of(8);
 
-        // For short messages, header + data buffer.
-        // For long messages: header + data buffer + control message.
-        let metadata_len = mem::size_of::<PacketHeader>()
-            + if likely(max_len <= UdTransport::max_data_in_pkt()) {
-                0
-            } else {
-                mem::size_of::<ControlMsg>()
-            };
-        max_len + metadata_len
+        // For long messages, there is an extra control message at the end.
+        if likely(max_len <= UdTransport::max_data_in_pkt()) {
+            max_len
+        } else {
+            max_len + mem::size_of::<ControlMsg>()
+        }
     }
 
     /// Create a new `MsgBuf` on owned buffer.
@@ -126,17 +122,11 @@ impl MsgBuf {
         }
     }
 
-    /// Create a new `MsgBuf` on not-owned buffer.
-    /// It must not be remote-accessible.
-    ///
-    /// # Safety
-    ///
-    /// The header must point to a valid `PacketHeader` right before actual payload data.
-    /// Note that the payload can be either application or control data.
+    /// Create a new `MsgBuf` on not-owned buffer. It must not be remote-accessible.
     #[inline]
-    pub(crate) unsafe fn borrowed(hdr: NonNull<PacketHeader>, data_len: usize, lkey: LKey) -> Self {
+    pub(crate) fn borrowed(data: NonNull<u8>, data_len: usize, lkey: LKey) -> Self {
         Self {
-            data: NonNull::new_unchecked(hdr.as_ptr().add(1) as *mut u8),
+            data,
             max_len: data_len,
             len: data_len,
             buffer: Buffer::fake(lkey, 0),
@@ -170,11 +160,18 @@ impl MsgBuf {
         }
     }
 
-    /// Get a pointer to a packet header.
+    /// Get a pointer to the packet header right before this MsgBuf.
+    ///
+    /// # Safety
+    ///
+    /// For only receive buffers returned by the transport, there is a packet header
+    /// before application data. Therefore, it is only safe to call this method on
+    /// receive buffers returned by [`UdTransport::rx_next()`]. For other `MsgBuf`s,
+    /// calling this method results in instant undefined behavior.
     #[inline]
-    pub(crate) fn pkt_hdr(&self) -> *mut PacketHeader {
+    pub(crate) unsafe fn pkt_hdr(&self) -> *mut PacketHeader {
         // SAFETY: the entire MsgBuf must be within the same allocated buffer.
-        let hdr = unsafe { self.data.as_ptr().sub(mem::size_of::<PacketHeader>()) };
+        let hdr = self.data.as_ptr().sub(mem::size_of::<PacketHeader>());
         debug_assert!(!hdr.is_null());
         debug_assert!(
             (hdr as usize) % mem::align_of::<PacketHeader>() == 0,

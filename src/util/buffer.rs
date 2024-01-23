@@ -22,21 +22,25 @@ pub(crate) struct Buffer {
 }
 
 impl Buffer {
-    /// A real buffer that will be deallocated when dropped.
-    ///
-    /// This constructor does not set `owner`. Use `set_owner` to set it.
+    /// A real buffer. Frees the buffer on drop if `owner` is `Some`.
     #[inline]
-    pub fn real(buf: NonNull<u8>, len: usize, lkey: LKey, rkey: RKey) -> Self {
+    pub fn real(
+        buf: NonNull<u8>,
+        len: usize,
+        lkey: LKey,
+        rkey: RKey,
+        owner: Option<Rc<BuddyAllocator>>,
+    ) -> Self {
         Self {
             buf,
             len,
             lkey,
             rkey,
-            owner: None,
+            owner,
         }
     }
 
-    /// A fake buffer that only serves to record `(LKey, RKey)`, and does nothing when dropped.
+    /// A fake buffer that only serves to record `(LKey, RKey)`.
     #[inline]
     pub fn fake(lkey: LKey, rkey: RKey) -> Self {
         Self {
@@ -70,12 +74,6 @@ impl Buffer {
     #[inline(always)]
     pub fn rkey(&self) -> RKey {
         self.rkey
-    }
-
-    /// Set the owner of the buffer.
-    #[inline(always)]
-    pub fn set_owner(&mut self, owner: &Rc<BuddyAllocator>) {
-        self.owner = Some(owner.clone());
     }
 }
 

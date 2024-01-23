@@ -31,6 +31,11 @@ pub(crate) struct SSlot {
     /// - For client: this is the user-provided response buffer.
     pub resp: MsgBuf,
 
+    /// Packet header for the outbound message.
+    /// - For server: response.
+    /// - For client: request.
+    pub pkthdr: MsgBuf,
+
     /// Whether the request is finished.
     /// - For server: this is set to `true` after the request handler returns
     ///   and the response is recorded.
@@ -41,9 +46,9 @@ pub(crate) struct SSlot {
 impl SSlot {
     /// Initialize a SSlot.
     #[inline]
-    pub fn new(state: &mut RpcInterior, role: SessionRole, idx: ReqIdx) -> Self {
+    pub fn new(state: &mut RpcInterior, role: SessionRole, req_idx: ReqIdx) -> Self {
         Self {
-            req_idx: idx,
+            req_idx,
             req_type: 0,
             req: MsgBuf::dummy(),
             pre_resp_msgbuf: match role {
@@ -51,6 +56,7 @@ impl SSlot {
                 SessionRole::Server => state.alloc_msgbuf(UdTransport::max_data_in_pkt()),
             },
             resp: MsgBuf::dummy(),
+            pkthdr: state.alloc_pkthdr_buf(),
             finished: false,
         }
     }
