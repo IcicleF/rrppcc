@@ -198,7 +198,7 @@ impl BuddyAllocator {
 
     /// Free a buffer.
     /// This does not actually free the memory, but returns it to the buddy allocator.
-    pub fn free(self: &Rc<Self>, buf: &Buffer) {
+    pub fn free(&self, buf: &Buffer) {
         self.inner.borrow_mut().free(buf)
     }
 }

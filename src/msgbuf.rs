@@ -1,5 +1,6 @@
+use std::mem::{self, MaybeUninit};
 use std::ptr::NonNull;
-use std::{mem, ptr, slice};
+use std::{ptr, slice};
 
 use crate::pkthdr::*;
 use crate::transport::{ControlMsg, LKey, RKey, UdTransport};
@@ -21,7 +22,7 @@ pub struct MsgBuf {
     buffer: Buffer,
 
     /// Padding to 64 bytes.
-    _padding: [u8; 8],
+    _padding: MaybeUninit<[u8; 8]>,
 }
 
 unsafe impl Send for MsgBuf {}
@@ -83,7 +84,7 @@ impl MsgBuf {
             max_len,
             len: data_len,
             buffer: buf,
-            _padding: [0; 8],
+            _padding: MaybeUninit::uninit(),
         };
 
         // If short message, return it directly ...
@@ -121,7 +122,7 @@ impl MsgBuf {
             max_len: data_len,
             len: data_len,
             buffer: buf,
-            _padding: [0; 8],
+            _padding: MaybeUninit::uninit(),
         }
     }
 
@@ -139,7 +140,7 @@ impl MsgBuf {
             max_len: data_len,
             len: data_len,
             buffer: Buffer::fake(lkey, 0),
-            _padding: [0; 8],
+            _padding: MaybeUninit::uninit(),
         }
     }
 
@@ -152,7 +153,7 @@ impl MsgBuf {
             max_len: 0,
             len: 0,
             buffer: Buffer::fake(0, 0),
-            _padding: [0; 8],
+            _padding: MaybeUninit::uninit(),
         }
     }
 
@@ -165,7 +166,7 @@ impl MsgBuf {
             max_len: self.max_len,
             len: self.len,
             buffer: Buffer::fake(self.lkey(), self.rkey()),
-            _padding: [0; 8],
+            _padding: MaybeUninit::uninit(),
         }
     }
 

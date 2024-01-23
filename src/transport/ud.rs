@@ -315,9 +315,12 @@ impl UdTransport {
         // when trying to poll CQEs from unposted WRs and break the invariant that
         // there is always exactly one unpolled CQE (after the first Tx packet).
         if unlikely(items.len() > Self::SQ_SIGNAL_BATCH) {
+            let chunks = items.chunks(Self::SQ_SIGNAL_BATCH);
+            let n = chunks.len();
+
             // SAFETY: recursion (induction).
-            for chunk in items.chunks(Self::SQ_SIGNAL_BATCH) {
-                self.tx_burst(chunk, drain);
+            for (i, chunk) in chunks.enumerate() {
+                self.tx_burst(chunk, drain && (i + 1 == n));
             }
             return;
         }
@@ -331,7 +334,7 @@ impl UdTransport {
 
             // Set signaled flag + poll send CQ if needed.
             wr.send_flags = if self.tx_pkt_idx % Self::SQ_SIGNAL_BATCH == 0 {
-                if self.tx_pkt_idx > 0 {
+                if likely(self.tx_pkt_idx > 0) {
                     self.qp.scq().poll_one_blocking_consumed();
                 }
                 ibv_send_flags::IBV_SEND_SIGNALED.0
@@ -404,14 +407,10 @@ impl UdTransport {
 
         // Poll send CQ and check the completions if we need to drain the send DMA queue.
         if unlikely(drain) {
-            let wcs = self
-                .qp
-                .scq()
-                .poll_blocking(need_poll)
-                .expect("failed to poll CQ");
-            for wc in wcs {
-                wc.ok().expect("failed to send");
+            for _ in 0..need_poll {
+                self.qp.scq().poll_one_blocking_consumed();
             }
+            self.tx_pkt_idx = 0;
         }
     }
 

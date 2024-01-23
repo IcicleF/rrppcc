@@ -424,7 +424,9 @@ impl Rpc {
         if unlikely(hdr.req_idx() != sslot.req_idx) {
             assert!(
                 hdr.req_idx() < sslot.req_idx,
-                "response for future request is impossible"
+                "response for future request is impossible: received {}, current {}",
+                hdr.req_idx(),
+                sslot.req_idx
             );
             log::debug!(
                 "RPC {}: dropping received SmallResponse for expired request (idx {}, current {})",
@@ -470,7 +472,9 @@ impl Rpc {
         if unlikely(hdr.req_idx() != sslot.req_idx) {
             assert!(
                 hdr.req_idx() < sslot.req_idx,
-                "response for future request is impossible"
+                "response for future request is impossible: received {}, current {}",
+                hdr.req_idx(),
+                sslot.req_idx
             );
             log::debug!(
                 "RPC {}: dropping received LargeResponse for expired request (idx {}, current {})",
@@ -888,6 +892,7 @@ macro_rules! do_sslot_move_next {
                     ret = Some(req);
                     break;
                 }
+                $sslot.req_idx += ACTIVE_REQ_WINDOW as ReqIdx;
             }
             ret
         } else {
@@ -1009,6 +1014,7 @@ impl Rpc {
 
             Request::new(self, resp_msgbuf, sess_id, sslot_idx, sslot.req_idx)
         } else {
+            // Find the shortest backlog queue.
             let (sslot_idx, pending_len) = sess
                 .req_backlog
                 .iter()
@@ -1080,6 +1086,11 @@ impl Rpc {
         let sess = &mut state.sessions[sess_id as usize];
         let sslot = &mut sess.slots[sslot_idx];
 
+        assert_eq!(
+            sslot.req_idx as usize % ACTIVE_REQ_WINDOW,
+            req_idx as usize % ACTIVE_REQ_WINDOW
+        );
+
         // Request has already expired, so it must be finished.
         // Would this really happen?
         if unlikely(sslot.req_idx > req_idx) {
@@ -1104,7 +1115,7 @@ impl Rpc {
         if unlikely(re_tx) {
             state.pending_tx.push(TxItem {
                 peer: sess.peer.as_ref().unwrap(),
-                msgbuf: &sslot.resp,
+                msgbuf: &sslot.req,
             });
         }
         false
