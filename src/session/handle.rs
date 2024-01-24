@@ -65,6 +65,7 @@ impl<'r> SessionHandle<'r> {
     /// Return `true` if the session is connected.
     #[inline]
     pub fn is_connected(&self) -> bool {
+        do_thread_check(self.rpc);
         self.rpc
             .session_connection_state(self.sess_id)
             .unwrap_or(false)
@@ -78,6 +79,7 @@ impl<'r> SessionHandle<'r> {
     where
         'r: 'a,
     {
+        do_thread_check(self.rpc);
         if likely(!self.is_connected()) {
             // Mark the session as connecting.
             let (cli_ud_ep, cli_sess_rc_ep) = self.rpc.mark_session_connecting(self.sess_id);

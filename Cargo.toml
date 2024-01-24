@@ -26,6 +26,9 @@ crossbeam = "0.8"
 ahash = "0.8"
 quanta = "0.12"
 
+[features]
+no_thread_checks = []
+
 [dev-dependencies]
 simple_logger = { version = "4.2.0", features = ["threads"] }
 tokio = { version = "1", features = ["full"] }

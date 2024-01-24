@@ -1,6 +1,6 @@
 use crate::rpc::Rpc;
-use std::thread;
 
+#[cfg(not(feature = "no_thread_checks"))]
 #[inline(always)]
 pub(crate) fn do_thread_check(rpc: &Rpc) {
     #[inline(never)]
@@ -9,7 +9,11 @@ pub(crate) fn do_thread_check(rpc: &Rpc) {
         panic!("Rpc must not be used on a different thread than it was created on");
     }
 
-    if thread::current().id() != rpc.thread_id {
-        do_thread_check_fail()
+    if std::thread::current().id() != rpc.thread_id {
+        do_thread_check_fail();
     }
 }
+
+#[cfg(feature = "no_thread_checks")]
+#[inline(always)]
+pub(crate) fn do_thread_check(_rpc: &Rpc) {}
