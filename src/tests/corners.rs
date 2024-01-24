@@ -4,6 +4,7 @@ use super::*;
 
 const RPC_HELLO: ReqType = 42;
 const RPC_NOMSG: ReqType = 99;
+const HELLO_WORLD: &str = "hello, world!";
 
 /// Test if zero-sized requests & responses can be correctly handled.
 #[test]
@@ -109,6 +110,91 @@ fn shared_req() {
     for resp_buf in resp_bufs {
         let payload = unsafe { resp_buf.as_slice() };
         assert_eq!(payload, &[magic_byte; 8]);
+    }
+
+    tx.send(()).unwrap();
+    handle.join().unwrap();
+}
+
+/// Test multiple concurrent requests (> window size) in a session.
+#[test]
+fn aborting_reqs() {
+    let cli_port = next_port();
+    let svr_port = next_port();
+
+    let (tx, rx) = mpsc::channel();
+    let (tx2, rx2) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let mut nx = Nexus::new(("127.0.0.1", svr_port));
+        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+            let mut resp_buf = req.pre_resp_buf();
+            unsafe {
+                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+            };
+            resp_buf.set_len(HELLO_WORLD.len());
+            resp_buf
+        });
+
+        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        tx2.send(()).unwrap();
+        while let Err(_) = rx.try_recv() {
+            rpc.progress();
+        }
+    });
+
+    let nx = Nexus::new(("127.0.0.1", cli_port));
+    let rpc = Rpc::new(&nx, 1, NIC_NAME, 1);
+
+    rx2.recv().unwrap();
+    let sess = rpc.create_session(("127.0.0.1", svr_port), 2);
+    assert!(block_on(sess.connect()));
+
+    // Multiple concurrent buffer & requests.
+    const N: usize = 64;
+    let req_bufs: [_; N] = array::from_fn(|_| rpc.alloc_msgbuf(16));
+    let mut resp_bufs: [_; N] = array::from_fn(|_| rpc.alloc_msgbuf(16));
+
+    // Issue requests.
+    let mut requests = Vec::with_capacity(N);
+    let mut resp_slice = &mut resp_bufs[..];
+    for i in 0..N {
+        let (resp, rest) = resp_slice.split_first_mut().unwrap();
+        requests.push(sess.request(RPC_HELLO, &req_bufs[i], resp));
+        resp_slice = rest;
+    }
+
+    // Abort some requests.
+    const ABORT_START: usize = 5;
+    const ABORT_END: usize = 31;
+
+    let mut filtered_reqs = Vec::new();
+    for (i, req) in requests.into_iter().enumerate() {
+        if i >= ABORT_START && i < ABORT_END {
+            req.abort();
+        } else {
+            filtered_reqs.push(req);
+        }
+    }
+
+    // Wait for all requests to complete.
+    block_on(join_all(filtered_reqs));
+
+    // Validation.
+    for (i, resp_buf) in resp_bufs.into_iter().enumerate() {
+        if (ABORT_START..ABORT_END).contains(&i) {
+            continue;
+        }
+
+        let payload = {
+            let mut payload = Vec::with_capacity(resp_buf.len());
+            unsafe {
+                ptr::copy_nonoverlapping(resp_buf.as_ptr(), payload.as_mut_ptr(), resp_buf.len());
+                payload.set_len(resp_buf.len());
+            }
+            String::from_utf8(payload).unwrap()
+        };
+        assert_eq!(payload, HELLO_WORLD);
     }
 
     tx.send(()).unwrap();
