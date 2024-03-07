@@ -15,8 +15,9 @@ fn single_req() {
     let (tx2, rx2) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(("127.0.0.1", svr_port));
-        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
                 ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
@@ -25,7 +26,6 @@ fn single_req() {
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();
@@ -72,8 +72,9 @@ fn multiple_reqs() {
     let (tx2, rx2) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(("127.0.0.1", svr_port));
-        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             assert!(resp_buf.len() == 4080);
             unsafe {
@@ -83,7 +84,6 @@ fn multiple_reqs() {
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();
@@ -132,8 +132,9 @@ fn concurrent_reqs_simple() {
     let (tx2, rx2) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(("127.0.0.1", svr_port));
-        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
                 ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
@@ -142,7 +143,6 @@ fn concurrent_reqs_simple() {
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();
@@ -205,8 +205,9 @@ fn nested_simple() {
     let svr2_handle = thread::spawn({
         let stop_flag = stop_flag.clone();
         move || {
-            let mut nx = Nexus::new(("127.0.0.1", svr_port_2));
-            nx.set_rpc_handler(RPC_HELLO, |req| async move {
+            let nx = Nexus::new(("127.0.0.1", svr_port_2));
+            let mut rpc = Rpc::new(&nx, 3, NIC_NAME, 1);
+            rpc.set_handler(RPC_HELLO, |req| async move {
                 let mut resp_buf = req.pre_resp_buf();
                 unsafe {
                     ptr::copy_nonoverlapping(
@@ -219,7 +220,6 @@ fn nested_simple() {
                 resp_buf
             });
 
-            let rpc = Rpc::new(&nx, 3, NIC_NAME, 1);
             tx_rdy2.send(()).unwrap();
             while !stop_flag.load(Ordering::SeqCst) {
                 rpc.progress();
@@ -230,8 +230,9 @@ fn nested_simple() {
     let svr1_handle = thread::spawn({
         let stop_flag = stop_flag.clone();
         move || {
-            let mut nx = Nexus::new(("127.0.0.1", svr_port_1));
-            nx.set_rpc_handler(RPC_HELLO, |req| async move {
+            let nx = Nexus::new(("127.0.0.1", svr_port_1));
+            let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+            rpc.set_handler(RPC_HELLO, |req| async move {
                 let nest_send_buf = req.rpc().alloc_msgbuf(16);
                 let mut nest_resp_buf = req.rpc().alloc_msgbuf(16);
 
@@ -250,8 +251,6 @@ fn nested_simple() {
                 };
                 resp_buf
             });
-
-            let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
 
             // Connect to svr_2.
             rx_rdy2.recv().unwrap();

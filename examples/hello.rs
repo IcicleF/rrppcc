@@ -15,8 +15,9 @@ fn main() {
 
     // Server thread.
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(SVR_URI);
-        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+        let nx = Nexus::new(SVR_URI);
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
                 ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
@@ -25,7 +26,6 @@ fn main() {
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         svr_ready_tx.send(()).unwrap();
         while let Err(_) = finish_rx.try_recv() {
             rpc.progress();

@@ -41,6 +41,9 @@ pub(crate) struct SSlot {
     ///   and the response is recorded.
     /// - For client: this is set to `true` after the response is received.
     pub finished: bool,
+
+    /// Whether this SSlot has a living associated request handle.
+    pub has_handle: bool,
 }
 
 impl SSlot {
@@ -58,6 +61,7 @@ impl SSlot {
             resp: MsgBuf::dummy(),
             pkthdr: state.alloc_pkthdr_buf(),
             finished: false,
+            has_handle: false,
         }
     }
 

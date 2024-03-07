@@ -1,11 +1,10 @@
 mod event;
 
-use std::future::Future;
 use std::io::ErrorKind as IoErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{atomic::*, Arc};
+use std::thread;
 use std::time::Duration;
-use std::{array, thread};
 
 use ahash::RandomState;
 use dashmap::DashMap;
@@ -13,8 +12,6 @@ use quanta::Upkeep;
 use rmp_serde as rmps;
 
 pub(crate) use self::event::*;
-use crate::handler::{ReqHandler, ReqHandlerFuture, RequestHandle};
-use crate::msgbuf::MsgBuf;
 use crate::type_alias::*;
 
 /// Session management part of [`Nexus`].
@@ -55,10 +52,7 @@ impl NexusSm {
 }
 
 /// A per-process singleton used for library initialization.
-///
-/// The main purpose of this type is binding handlers to specific request
-/// types. All handlers should be set before any [`Rpc`](`crate::Rpc`)s are
-/// created.
+/// It manages connections between local and remote `Rpc`s.
 ///
 /// # Background threads
 ///
@@ -73,8 +67,6 @@ impl NexusSm {
 /// thread is launched by you, then your configuration will affect the
 /// packet loss detection of all `Rpc`s in the process.
 pub struct Nexus {
-    rpc_handlers: [Option<ReqHandler>; ReqType::MAX as usize + 1],
-
     sm: Arc<NexusSm>,
     sm_thread: Option<thread::JoinHandle<()>>,
     _upkeeper: Option<quanta::Handle>,
@@ -95,24 +87,6 @@ impl Nexus {
     /// Destroy the event channel for the given RPC ID.
     pub(crate) fn destroy_event_channel(&self, rpc_id: RpcId) {
         self.sm.sm_evt_tx.remove(&rpc_id);
-    }
-
-    /// Return `true` if the given request type is registered with a request handler.
-    #[inline(always)]
-    pub(crate) fn has_rpc_handler(&self, req_type: ReqType) -> bool {
-        self.rpc_handlers[req_type as usize].is_some()
-    }
-
-    /// Call the registered request handler for the given request type.
-    ///
-    /// # Panics
-    ///
-    /// Panic if there is no such request handler.
-    #[inline]
-    pub(crate) fn call_rpc_handler(&self, req: RequestHandle) -> ReqHandlerFuture {
-        let req_type = req.req_type();
-        let handler = self.rpc_handlers[req_type as usize].as_ref().unwrap();
-        handler(req)
     }
 }
 
@@ -166,7 +140,6 @@ impl Nexus {
         }
 
         Arc::new(Self {
-            rpc_handlers: array::from_fn(|_| None),
             sm,
             sm_thread: Some(sm_listener),
             _upkeeper: upkeeper.ok(),
@@ -177,25 +150,6 @@ impl Nexus {
     #[inline]
     pub fn uri(&self) -> SocketAddr {
         self.sm.uri
-    }
-
-    /// Set the handler for the given request type.
-    /// This must be done before any [`Rpc`](`crate::Rpc`)s are created on this `Nexus`.
-    ///
-    /// The handler takes a request handle as argument, and must return a `MsgBuf` that
-    /// belongs to the same `Rpc` calling the handler (otherwise, panic).
-    ///
-    /// # Panics
-    ///
-    /// Panic if there is already an `Rpc` created.
-    pub fn set_rpc_handler<H, F>(self: &mut Arc<Self>, req_id: ReqType, handler: H)
-    where
-        H: Fn(RequestHandle) -> F + Send + Sync + 'static,
-        F: Future<Output = MsgBuf> + Send + Sync + 'static,
-    {
-        let this =
-            Arc::get_mut(self).expect("cannot set request handlers after `Rpc`s are created");
-        this.rpc_handlers[req_id as usize] = Some(Box::new(move |req| Box::pin(handler(req))));
     }
 }
 

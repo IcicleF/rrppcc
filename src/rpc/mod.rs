@@ -11,17 +11,16 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::thread::{self, ThreadId};
-use std::{cmp, mem, ptr};
+use std::{array, cmp, mem, ptr};
 
-use futures::future::FutureExt;
+use futures::future::{Future, FutureExt};
 use futures::task::noop_waker_ref;
 use rmp_serde as rmps;
 use rrddmma::rdma::qp::QpEndpoint;
 
 use self::pending::*;
 use crate::type_alias::*;
-use crate::util::{buddy::*, likely::*, slab::*, thread_check::*};
+use crate::util::{buddy::*, likely::*, slab::*};
 use crate::{handler::*, msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*};
 
 #[cfg(debug_assertions)]
@@ -51,8 +50,8 @@ pub(crate) struct RpcInterior {
     slab: SlabAllocator<PacketHeader>,
 
     /// Buffer allocator.
-    /// This need to be the last one to drop.
-    allocator: Rc<BuddyAllocator>,
+    /// For safety, this is the last one to drop.
+    buddy: Rc<BuddyAllocator>,
 }
 
 impl RpcInterior {
@@ -76,7 +75,7 @@ impl RpcInterior {
     pub fn alloc_msgbuf(&mut self, len: usize) -> MsgBuf {
         // SAFETY: `self.allocator` is guaranteed to be valid.
         let buf_len = MsgBuf::buf_len(len);
-        let buf = self.allocator.alloc(buf_len, &mut self.tp);
+        let buf = self.buddy.alloc(buf_len, &mut self.tp);
         MsgBuf::owned(buf, len)
     }
 
@@ -100,8 +99,6 @@ pub struct Rpc {
     id: RpcId,
     /// Nexus this RPC is bound to.
     nexus: Arc<Nexus>,
-    /// The thread ID of the thread that created this RPC instance.
-    pub(crate) thread_id: ThreadId,
 
     /// Session management packet sender.
     /// Use a independent socket, no need to delegate to the Nexus.
@@ -113,6 +110,9 @@ pub struct Rpc {
     /// Depending on the build mode, this field is either the checked [`RefCell`]
     /// or the unchecked [`UnsafeCell`](std::cell::UnsafeCell) with some wrappings.
     state: InteriorCell<RpcInterior>,
+
+    /// RPC handlers.
+    handlers: [Option<ReqHandler>; ReqType::MAX as usize + 1],
 
     /// A flag indicating whether this RPC is progressing.
     ///
@@ -243,7 +243,7 @@ impl Rpc {
 
         // Check request type sanity.
         let req_type = pkthdr.req_type();
-        if unlikely(!self.nexus.has_rpc_handler(req_type)) {
+        if unlikely(!self.has_rpc_handler(req_type)) {
             log::debug!(
                 "RPC {}: dropping received SmallReq for unknown request type {:?}",
                 self.id,
@@ -279,7 +279,7 @@ impl Rpc {
         drop(real_state);
 
         // Call the request handler with no `state` borrows.
-        let mut resp_fut = self.nexus.call_rpc_handler(request);
+        let mut resp_fut = self.call_rpc_handler(request);
 
         // Immediately poll the Future.
         // This will make synchronous handlers return, and push asynchronous handlers
@@ -294,6 +294,10 @@ impl Rpc {
         let sslot = &mut sess.slots[sslot_idx];
         match response {
             Poll::Ready(resp) => {
+                assert!(
+                    !sslot.has_handle,
+                    "RequestHandle not dropped after handler finishes"
+                );
                 do_response_tx!(ENQUEUE, state, sess, sslot, resp);
                 true
             }
@@ -328,7 +332,7 @@ impl Rpc {
 
         // Check request type sanity.
         let req_type = hdr.req_type();
-        if unlikely(!self.nexus.has_rpc_handler(req_type)) {
+        if unlikely(!self.has_rpc_handler(req_type)) {
             log::debug!(
                 "RPC {}: dropping received LargeReq for unknown request type {:?}",
                 self.id,
@@ -354,7 +358,7 @@ impl Rpc {
 
         // Prepare a buffer for the request.
         let data_len = hdr.data_len() as usize;
-        let req_buf = state.allocator.alloc(data_len, &mut state.tp);
+        let req_buf = state.buddy.alloc(data_len, &mut state.tp);
         sslot.req = MsgBuf::owned_immutable(req_buf, data_len);
 
         // Downgrade the borrow to SSlot as immutable to make the borrow checker happy.
@@ -375,9 +379,9 @@ impl Rpc {
     /// Panic if `self.state` is already borrowed.
     #[allow(dropping_references)]
     fn process_large_request_body(&self, sess_id: SessId, sslot_idx: usize) {
-        let state = self.state.borrow();
-        let sess = &state.sessions[sess_id as usize];
-        let sslot = &sess.slots[sslot_idx];
+        let mut state = self.state.borrow_mut();
+        let sess = &mut state.sessions[sess_id as usize];
+        let sslot = &mut sess.slots[sslot_idx];
 
         // No need for any sanity check, as that is already done when handling the control message.
         // Construct the request. This will fetch the raw pointer of the current `Rpc` and `sslot`.
@@ -385,7 +389,7 @@ impl Rpc {
         drop(state);
 
         // Call the request handler with no `state` borrows.
-        let mut resp_fut = self.nexus.call_rpc_handler(request);
+        let mut resp_fut = self.call_rpc_handler(request);
 
         // Immediately poll the Future.
         // This will make synchronous handlers return, and push asynchronous handlers
@@ -400,6 +404,10 @@ impl Rpc {
         let sslot = &mut sess.slots[sslot_idx];
         match response {
             Poll::Ready(resp) => {
+                assert!(
+                    !sslot.has_handle,
+                    "RequestHandle not dropped after handler finishes"
+                );
                 do_response_tx!(ENQUEUE, state, sess, sslot, resp);
             }
             Poll::Pending => {
@@ -875,8 +883,13 @@ impl Rpc {
             let sess = &mut state.sessions[sess_id as usize];
             let sslot = &mut sess.slots[sslot_idx];
 
+            assert!(
+                !sslot.has_handle,
+                "RequestHandle not dropped after handler finishes"
+            );
+
             // Release the request buffer.
-            // SAFETY: this buffer is not released before because
+            // SAFETY: this buffer is not released before because:
             // - `process_small_request()` returns `false`, preventing it from getting
             //   released in `process_rx()`;
             // - previous polls to the handler future gives `Pending`, not doing anything
@@ -947,8 +960,26 @@ macro_rules! do_sslot_move_next {
     };
 }
 
-// Crate-internal API.
+// Crate-internal APIs.
 impl Rpc {
+    /// Return `true` if the given request type is registered with a request handler.
+    #[inline(always)]
+    pub(crate) fn has_rpc_handler(&self, req_type: ReqType) -> bool {
+        self.handlers[req_type as usize].is_some()
+    }
+
+    /// Call the registered request handler for the given request type.
+    ///
+    /// # Panics
+    ///
+    /// Panic if there is no such request handler.
+    #[inline]
+    pub(crate) fn call_rpc_handler(&self, req: RequestHandle) -> ReqHandlerFuture {
+        let req_type = req.req_type();
+        let handler = self.handlers[req_type as usize].as_ref().unwrap();
+        handler(req)
+    }
+
     /// Return `true` if the session of the given ID exists and is connected.
     ///
     /// # Panics
@@ -1169,7 +1200,7 @@ impl Rpc {
     }
 }
 
-// Public API.
+// Public APIs.
 impl Rpc {
     /// Create a new `Rpc` instance that is bound to a [`Nexus`] with a certain
     /// ID and the current thread. Will operate on the specified port of the given
@@ -1192,8 +1223,6 @@ impl Rpc {
         Box::pin(Self {
             id,
             nexus: nexus.clone(),
-            thread_id: thread::current().id(),
-
             sm_tx: UdpSocket::bind("0.0.0.0:0").unwrap(),
             sm_rx,
             state: InteriorCell::new(RpcInterior {
@@ -1203,8 +1232,9 @@ impl Rpc {
                 pending_handlers: Vec::with_capacity(PREALLOC_SIZE),
                 pending_tx: Vec::with_capacity(PREALLOC_SIZE),
                 slab: SlabAllocator::new(),
-                allocator: Rc::new(BuddyAllocator::new()),
+                buddy: Rc::new(BuddyAllocator::new()),
             }),
+            handlers: array::from_fn(|_| None),
             progressing: RefCell::new(()),
             _pinned: PhantomPinned,
         })
@@ -1222,6 +1252,23 @@ impl Rpc {
         &self.nexus
     }
 
+    /// Set the handler for the given request type.
+    /// The handler takes a request handle as argument, and must return a `MsgBuf` that
+    /// belongs to the same `Rpc` calling the handler (otherwise, panic).
+    ///
+    /// # Panics
+    ///
+    /// Panic if there is already an `Rpc` created.
+    pub fn set_handler<H, F>(self: &mut Pin<Box<Self>>, req_id: ReqType, handler: H)
+    where
+        H: Fn(RequestHandle) -> F + 'static,
+        F: Future<Output = MsgBuf> + 'static,
+    {
+        // SAFETY: `self` is treated as pinned in this method.
+        let this = unsafe { Pin::into_inner_unchecked(self.as_mut()) };
+        this.handlers[req_id as usize] = Some(Box::new(move |req| Box::pin(handler(req))));
+    }
+
     /// Create a client session that connects to a remote `Rpc` instance.
     ///
     /// The created session is not connected by default, and it will spend no
@@ -1236,8 +1283,6 @@ impl Rpc {
         remote_uri: impl ToSocketAddrs,
         remote_rpc_id: RpcId,
     ) -> SessionHandle {
-        do_thread_check(self);
-
         // Get the URI first so that we can panic early.
         let remote_uri = remote_uri
             .to_socket_addrs()
@@ -1270,8 +1315,6 @@ impl Rpc {
 
     /// Return a handle to a session of the given ID.
     pub fn get_session(&self, sess_id: SessId) -> Option<SessionHandle> {
-        do_thread_check(self);
-
         // Borrow the state, thread-unsafe.
         let state = self.state.borrow();
         if state.sessions.len() <= sess_id as usize {
@@ -1300,7 +1343,6 @@ impl Rpc {
     /// Panic if buffer allocation fails.
     #[inline]
     pub fn alloc_msgbuf(&self, len: usize) -> MsgBuf {
-        do_thread_check(self);
         self.state.borrow_mut().alloc_msgbuf(len)
     }
 
@@ -1311,8 +1353,6 @@ impl Rpc {
     /// - scheduling and (re)transmitting datapath packets.
     #[inline]
     pub fn progress(&self) {
-        do_thread_check(self);
-
         // Prevent reentrance of this method.
         let Ok(_flag) = self.progressing.try_borrow_mut() else {
             return;

@@ -10,7 +10,7 @@ use quanta::Instant;
 use crate::msgbuf::MsgBuf;
 use crate::rpc::Rpc;
 use crate::type_alias::*;
-use crate::util::{likely::*, thread_check::*};
+use crate::util::likely::*;
 
 /// An awaitable object that represents an incompleted RPC request.
 ///
@@ -35,9 +35,6 @@ pub struct Request<'a> {
     /// Time of the last transmission of the request.
     start_time: Instant,
 }
-
-unsafe impl Send for Request<'_> {}
-unsafe impl Sync for Request<'_> {}
 
 impl<'a> Request<'a> {
     /// Create a new request.
@@ -72,7 +69,6 @@ impl Request<'_> {
     /// to a traversal of the pending queue, which is not very efficient.
     #[inline]
     pub fn abort(self) {
-        do_thread_check(self.rpc);
         self.rpc
             .abort_request((self.sess_id, self.sslot_idx, self.req_idx));
     }
@@ -82,8 +78,6 @@ impl<'a> Future for Request<'a> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        do_thread_check(self.rpc);
-
         // If the request has finished, return the response.
         let need_re_tx = Instant::recent() - self.start_time > Self::RETX_TIMEOUT;
         if self.rpc.check_request_completion(

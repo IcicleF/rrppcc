@@ -14,12 +14,3 @@ Major features include:
 To use this library, you must have an available RDMA NIC installed on your computer.
 Mellanox's ConnectX adaptor series are the best;
 others should also work as long as you have `libibverbs` installed, but they are not tested.
-
-
-## Unsoundness
-
-rrppcc is **unsound**.
-Undefined behavior may occur even if you only access safe interface.
-
-Generally, you do not need to worry about the unsoundness, as normal use cases will not trigger UB.
-However, you should read the *Unsoundness* sections in the documentation carefully.

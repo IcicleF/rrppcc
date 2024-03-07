@@ -19,8 +19,9 @@ fn large_req() {
     let req_byte = rand::thread_rng().gen::<u8>();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(("127.0.0.1", svr_port));
-        nx.set_rpc_handler(RPC_HELLO, move |req| async move {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, move |req| async move {
             assert_eq!(req.req_buf().len(), REQ_LEN);
             let payload = unsafe { req.req_buf().as_slice() };
             assert!(payload.iter().all(|&b| b == req_byte));
@@ -33,7 +34,6 @@ fn large_req() {
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();
@@ -85,14 +85,14 @@ fn large_resp() {
     let resp_byte = rand::thread_rng().gen::<u8>();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(("127.0.0.1", svr_port));
-        nx.set_rpc_handler(RPC_HELLO, move |req| async move {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, move |req| async move {
             let resp_buf = req.rpc().alloc_msgbuf(RESP_LEN);
             unsafe { ptr::write_bytes(resp_buf.as_ptr(), resp_byte, RESP_LEN) };
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();

@@ -25,9 +25,6 @@ pub struct MsgBuf {
     _padding: MaybeUninit<[u8; 8]>,
 }
 
-unsafe impl Send for MsgBuf {}
-unsafe impl Sync for MsgBuf {}
-
 impl MsgBuf {
     /// Maximum application data bytes in a single `MsgBuf`.
     pub const MAX_DATA_LEN: usize = BuddyAllocator::MAX_ALLOC_SIZE - 64;

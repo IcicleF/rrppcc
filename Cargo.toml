@@ -20,14 +20,11 @@ paste = "1.0"
 log = "0.4.17"
 libc = "0.2"
 futures = "0.3"
-local-ip-address = "0.5"
+local-ip-address = "0.6"
 dashmap = "5.5"
 crossbeam = "0.8"
 ahash = "0.8"
 quanta = "0.12"
-
-[features]
-no_thread_checks = []
 
 [dev-dependencies]
 simple_logger = { version = "4.2.0", features = ["threads"] }

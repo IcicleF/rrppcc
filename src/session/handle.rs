@@ -10,7 +10,7 @@ use crate::nexus::{SmEvent, SmEventDetails};
 use crate::request::Request;
 use crate::rpc::Rpc;
 use crate::type_alias::*;
-use crate::util::{likely::*, thread_check::*};
+use crate::util::likely::*;
 
 /// Handle to a session that points to a specific remote `Rpc` endpoint.
 #[derive(Clone, Copy)]
@@ -27,9 +27,6 @@ pub struct SessionHandle<'r> {
     /// Peer Rpc ID.
     remote_rpc_id: RpcId,
 }
-
-unsafe impl Send for SessionHandle<'_> {}
-unsafe impl Sync for SessionHandle<'_> {}
 
 impl<'r> SessionHandle<'r> {
     /// Create a new session handle.
@@ -65,7 +62,6 @@ impl<'r> SessionHandle<'r> {
     /// Return `true` if the session is connected.
     #[inline]
     pub fn is_connected(&self) -> bool {
-        do_thread_check(self.rpc);
         self.rpc
             .session_connection_state(self.sess_id)
             .unwrap_or(false)
@@ -79,7 +75,6 @@ impl<'r> SessionHandle<'r> {
     where
         'r: 'a,
     {
-        do_thread_check(self.rpc);
         if likely(!self.is_connected()) {
             // Mark the session as connecting.
             let (cli_ud_ep, cli_sess_rc_ep) = self.rpc.mark_session_connecting(self.sess_id);
@@ -123,7 +118,6 @@ impl<'r> SessionHandle<'r> {
     where
         'r: 'a,
     {
-        do_thread_check(self.rpc);
         self.rpc
             .enqueue_request(self.sess_id, req_type, req_msgbuf, resp_msgbuf)
     }
@@ -142,8 +136,6 @@ impl Future for SessionConnect<'_> {
     type Output = bool;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        do_thread_check(self.rpc);
-
         // Check if the session connection state has already been determined.
         if let Some(result) = self.rpc.session_connection_state(self.sess_id) {
             Poll::Ready(result)
@@ -154,6 +146,3 @@ impl Future for SessionConnect<'_> {
         }
     }
 }
-
-unsafe impl Send for SessionConnect<'_> {}
-unsafe impl Sync for SessionConnect<'_> {}

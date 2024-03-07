@@ -16,14 +16,14 @@ fn zero_sized() {
     let (tx2, rx2) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(("127.0.0.1", svr_port));
-        nx.set_rpc_handler(RPC_NOMSG, |req| async move {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_NOMSG, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             resp_buf.set_len(0);
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();
@@ -62,8 +62,9 @@ fn shared_req() {
     let (tx2, rx2) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(("127.0.0.1", svr_port));
-        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             let req_buf = req.req_buf();
             unsafe { ptr::copy_nonoverlapping(req_buf.as_ptr(), resp_buf.as_ptr(), req_buf.len()) };
@@ -71,7 +72,6 @@ fn shared_req() {
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();
@@ -126,8 +126,9 @@ fn aborting_reqs() {
     let (tx2, rx2) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new(("127.0.0.1", svr_port));
-        nx.set_rpc_handler(RPC_HELLO, |req| async move {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
                 ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
@@ -136,7 +137,6 @@ fn aborting_reqs() {
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();

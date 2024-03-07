@@ -30,21 +30,21 @@ pub fn benchmark_sync(c: &mut Criterion) {
     let (tx2, rx2) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let mut nx = Nexus::new((LOCALHOST, SVR_PORT));
-        nx.set_rpc_handler(RPC_SMALL, |req| async move {
+        let nx = Nexus::new((LOCALHOST, SVR_PORT));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+
+        rpc.set_handler(RPC_SMALL, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe { ptr::write_bytes(resp_buf.as_ptr(), 1, SMALL_RPC_LEN) };
             resp_buf.set_len(SMALL_RPC_LEN);
             resp_buf
         });
-
-        nx.set_rpc_handler(RPC_LARGE, |req| async move {
+        rpc.set_handler(RPC_LARGE, |req| async move {
             let resp_buf = req.rpc().alloc_msgbuf(LARGE_RPC_LEN);
             unsafe { ptr::write_bytes(resp_buf.as_ptr(), 1, LARGE_RPC_LEN) };
             resp_buf
         });
 
-        let rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         tx2.send(()).unwrap();
         while let Err(_) = rx.try_recv() {
             rpc.progress();

@@ -4,7 +4,6 @@ mod sslot;
 use std::array;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::pin::Pin;
 
 use rrddmma::rdma::qp::{Qp, QpPeer};
 
@@ -60,18 +59,11 @@ pub(crate) struct Session {
     pub rc_qp: Qp,
 
     /// Session request slots.
-    ///
     /// Pinned in heap to avoid moving around, invalidating pointers.
-    pub slots: Pin<Box<[SSlot; ACTIVE_REQ_WINDOW]>>,
+    pub slots: Box<[SSlot; ACTIVE_REQ_WINDOW]>,
     /// Available SSlot index list.
     pub avail_slots: VecDeque<usize>,
     /// Queue for requests that are waiting for credits.
-    ///
-    /// FIXME?: the [`Request`] type records the `SSlot` index, which requires the
-    /// `SSlot` of a request to be determined immediately. However, for requests
-    /// in the backlog queue, the `SSlot` is not determined until the request is
-    /// dequeued. Therefore, we must maintain a separate queue for each SSlot.
-    /// This wastes memory and possibly reduces performance.
     pub req_backlog: [VecDeque<PendingRequest>; ACTIVE_REQ_WINDOW],
 }
 
@@ -95,7 +87,7 @@ impl Session {
             peer: None,
             rc_qp,
 
-            slots: Box::pin(slots),
+            slots: Box::new(slots),
             avail_slots: (0..ACTIVE_REQ_WINDOW).collect(),
             req_backlog: array::from_fn(|_| VecDeque::new()),
         }
