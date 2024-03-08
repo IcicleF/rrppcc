@@ -200,3 +200,55 @@ fn aborting_reqs() {
     tx.send(()).unwrap();
     handle.join().unwrap();
 }
+
+#[test]
+#[should_panic(expected = "RequestHandle not dropped after handler finishes")]
+fn moving_req_handle() {
+    let cli_port = next_port();
+    let svr_port = next_port();
+
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let nx = Nexus::new(("127.0.0.1", svr_port));
+        let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
+        rpc.set_handler(RPC_HELLO, |req| async move {
+            let mut resp_buf = req.pre_resp_buf();
+            unsafe {
+                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+            };
+            std::mem::forget(req);
+
+            resp_buf.set_len(HELLO_WORLD.len());
+            resp_buf
+        });
+
+        tx.send(()).unwrap();
+        loop {
+            rpc.progress();
+        }
+    });
+
+    let nx = Nexus::new(("127.0.0.1", cli_port));
+    let rpc = Rpc::new(&nx, 1, NIC_NAME, 1);
+
+    rx.recv().unwrap();
+    let sess = rpc.create_session(("127.0.0.1", svr_port), 2);
+    assert!(block_on(sess.connect()));
+
+    // Prepare buffer.
+    let req_buf = rpc.alloc_msgbuf(16);
+    let mut resp_buf = rpc.alloc_msgbuf(16);
+
+    // Send request, and make some progress to send out the request.
+    let _request = sess.request(RPC_HELLO, &req_buf, &mut resp_buf);
+    for _ in 0..10 {
+        rpc.progress();
+    }
+
+    // Let the test panic in the same way as the server thread.
+    if let Err(e) = handle.join() {
+        if let Some(e) = e.downcast_ref::<&'static str>() {
+            panic!("server panicked: {}", e);
+        }
+    }
+}
