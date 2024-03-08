@@ -125,9 +125,6 @@ pub struct Rpc {
     _pinned: PhantomPinned,
 }
 
-unsafe impl Send for Rpc {}
-unsafe impl Sync for Rpc {}
-
 /// A macro that handles response transmission logic.
 /// - `ENQUEUE`: normal response enqueue, after calling the handler.
 /// - `RETRANSMIT`: detect and retransmission of generated response, before even
