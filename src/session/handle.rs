@@ -2,7 +2,9 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use quanta::Instant;
 use rmp_serde as rmps;
 
 use crate::msgbuf::MsgBuf;
@@ -71,11 +73,12 @@ impl<'r> SessionHandle<'r> {
     ///
     /// This method returns an awaitable object that resolves to a
     /// boolean value indicating whether the connection is successful.
+    /// Note that connection will not start until the first poll.
     pub fn connect<'a>(&'a self) -> impl Future<Output = bool> + 'a
     where
         'r: 'a,
     {
-        if likely(!self.is_connected()) {
+        let msg = if likely(!self.is_connected()) {
             // Mark the session as connecting.
             let (cli_ud_ep, cli_sess_rc_ep) = self.rpc.mark_session_connecting(self.sess_id);
 
@@ -90,17 +93,17 @@ impl<'r> SessionHandle<'r> {
                     cli_sess_rc_ep,
                 },
             };
-
-            let event_buf = rmps::to_vec(&event).unwrap();
-            self.rpc
-                .sm_tx
-                .send_to(&event_buf, self.remote_uri)
-                .expect("failed to send ConnectRequest");
-        }
+            rmps::to_vec(&event).unwrap()
+        } else {
+            Vec::new()
+        };
 
         SessionConnect {
             rpc: self.rpc,
             sess_id: self.sess_id,
+            remote_uri: self.remote_uri,
+            msg,
+            start_time: Instant::now() - SessionConnect::TIMEOUT,
         }
     }
 
@@ -130,16 +133,39 @@ struct SessionConnect<'a> {
 
     /// Session ID.
     sess_id: SessId,
+
+    /// URI of the remote peer's Nexus.
+    remote_uri: SocketAddr,
+
+    /// The message to send to the remote peer's Nexus.
+    msg: Vec<u8>,
+
+    /// The time when the last SM packet is sent.
+    start_time: Instant,
+}
+
+impl SessionConnect<'_> {
+    /// Connection timeout duration.
+    pub const TIMEOUT: Duration = Duration::from_millis(100);
 }
 
 impl Future for SessionConnect<'_> {
     type Output = bool;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Check if the session connection state has already been determined.
         if let Some(result) = self.rpc.session_connection_state(self.sess_id) {
             Poll::Ready(result)
         } else {
+            // Send the connect request to the remote peer if timeout.
+            if self.start_time.elapsed() >= Self::TIMEOUT {
+                self.rpc
+                    .sm_tx
+                    .send_to(&self.msg, self.remote_uri)
+                    .expect("failed to send ConnectRequest");
+                self.start_time = Instant::now();
+            }
+
             self.rpc.progress();
             cx.waker().wake_by_ref();
             Poll::Pending

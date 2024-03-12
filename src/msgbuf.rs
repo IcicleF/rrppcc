@@ -31,7 +31,7 @@ impl MsgBuf {
 
     /// Return the needed buffer size for the given data length.
     #[inline(always)]
-    pub(crate) const fn buf_len(data_len: usize) -> usize {
+    pub(crate) fn buf_len(data_len: usize) -> usize {
         // Roundup data length to multiplicity of 8.
         let max_len = data_len.next_multiple_of(8);
 
