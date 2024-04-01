@@ -885,13 +885,15 @@ impl Rpc {
                 "RequestHandle not dropped after handler finishes"
             );
 
-            // Release the request buffer.
-            // SAFETY: this buffer is not released before because:
-            // - `process_small_request()` returns `false`, preventing it from getting
-            //   released in `process_rx()`;
-            // - previous polls to the handler future gives `Pending`, not doing anything
-            //   to this buffer.
-            unsafe { state.tp.rx_release(&sslot.req) };
+            // Release the request buffer, but only if it is a large request.
+            if sslot.req.is_small() {
+                // SAFETY: this buffer is not released before because:
+                // - `process_small_request()` returns `false`, preventing it from getting
+                //   released in `process_rx()`;
+                // - previous polls to the handler future gives `Pending`, not doing anything
+                //   to this buffer.
+                unsafe { state.tp.rx_release(&sslot.req) };
+            }
 
             do_response_tx!(ENQUEUE, state, sess, sslot, resp);
         }

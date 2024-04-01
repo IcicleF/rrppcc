@@ -1,6 +1,7 @@
 //! Simple tests for small RPCs.
 
 use super::*;
+use futures::join;
 
 const HELLO_WORLD: &str = "hello, world!";
 const RPC_HELLO: ReqType = 42;
@@ -124,7 +125,7 @@ fn multiple_reqs() {
 
 /// Test multiple concurrent requests (> window size) in a session.
 #[test]
-fn concurrent_reqs_simple() {
+fn concurrent_reqs() {
     let cli_port = next_port();
     let svr_port = next_port();
 
@@ -190,9 +191,9 @@ fn concurrent_reqs_simple() {
     handle.join().unwrap();
 }
 
-/// Test a single nested RPC request.
+/// Test nested small RPC requests.
 #[test]
-fn nested_simple() {
+fn nested() {
     let cli_port = next_port();
     let svr_port_1 = next_port();
     let svr_port_2 = next_port();
@@ -234,21 +235,28 @@ fn nested_simple() {
             let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
             rpc.set_handler(RPC_HELLO, |req| async move {
                 let nest_send_buf = req.rpc().alloc_msgbuf(16);
-                let mut nest_resp_buf = req.rpc().alloc_msgbuf(16);
+                let mut nest_resp_buf1 = req.rpc().alloc_msgbuf(16);
+                let mut nest_resp_buf2 = req.rpc().alloc_msgbuf(16);
 
                 let sess = req.rpc().get_session(0).unwrap();
-                let nest_req = sess.request(RPC_HELLO, &nest_send_buf, &mut nest_resp_buf);
-                nest_req.await;
+                let nest_req1 = sess.request(RPC_HELLO, &nest_send_buf, &mut nest_resp_buf1);
+                let nest_req2 = sess.request(RPC_HELLO, &nest_send_buf, &mut nest_resp_buf2);
+                join!(nest_req1, nest_req2);
 
                 let mut resp_buf = req.pre_resp_buf();
-                resp_buf.set_len(nest_resp_buf.len());
+                resp_buf.set_len(nest_resp_buf1.len() + nest_resp_buf2.len());
                 unsafe {
                     ptr::copy_nonoverlapping(
-                        nest_resp_buf.as_ptr(),
+                        nest_resp_buf1.as_ptr(),
                         resp_buf.as_ptr(),
-                        nest_resp_buf.len(),
-                    )
-                };
+                        nest_resp_buf1.len(),
+                    );
+                    ptr::copy_nonoverlapping(
+                        nest_resp_buf2.as_ptr(),
+                        resp_buf.as_ptr().add(nest_resp_buf1.len()),
+                        nest_resp_buf2.len(),
+                    );
+                }
                 resp_buf
             });
 
@@ -277,10 +285,11 @@ fn nested_simple() {
 
     // Prepare buffer.
     let req_buf = rpc.alloc_msgbuf(16);
-    let mut resp_buf = rpc.alloc_msgbuf(16);
+    let mut resp_buf = rpc.alloc_msgbuf(32);
 
     // Send request.
-    for _ in 0..10000 {
+    let expected = HELLO_WORLD.to_owned() + HELLO_WORLD;
+    for _ in 0..100000 {
         unsafe { ptr::write_bytes(resp_buf.as_ptr(), 0, 16) };
 
         let request = sess.request(RPC_HELLO, &req_buf, &mut resp_buf);
@@ -295,7 +304,7 @@ fn nested_simple() {
             }
             String::from_utf8(payload).unwrap()
         };
-        assert_eq!(payload, HELLO_WORLD);
+        assert_eq!(payload, expected);
     }
 
     stop_flag.store(true, Ordering::SeqCst);

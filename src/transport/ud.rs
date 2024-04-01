@@ -91,7 +91,7 @@ impl UdTransport {
 
     const RQ_SIZE: usize = 1 << 12;
     const RQ_POLL_BATCH: usize = 1 << 4;
-    const RQ_POSTLIST_SIZE: usize = 1 << 6;
+    const RQ_POSTLIST_SIZE: usize = 1 << 4;
     const RX_UNIT_ALLOC_SIZE: usize = CACHELINE_SIZE + Self::MTU;
     const RX_UNIT_SIZE: usize = Self::GRH_SIZE + Self::MTU;
 }

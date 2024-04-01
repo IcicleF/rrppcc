@@ -220,7 +220,7 @@ impl MsgBuf {
 }
 
 impl MsgBuf {
-    /// Return a pointer to the first *application data* byte.
+    /// Return a pointer to the first application data byte.
     #[inline(always)]
     pub fn as_ptr(&self) -> *mut u8 {
         self.data.as_ptr()
