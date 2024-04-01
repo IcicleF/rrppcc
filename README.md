@@ -17,6 +17,6 @@ others should also work as long as you have `libibverbs` installed, but they are
 
 ## Versioning
 
-- `0.2.4`: Use this version if you want to bind RPC handlers to `Nexus`, and can tolerate some unsoundness and counter-intuitive semantics 
+- `0.2`: Use this version if you want to bind RPC handlers to `Nexus`, and can tolerate some unsoundness and counter-intuitive semantics 
   (the `Send + Sync` traits are implemented on the types, but they actually can only be used in one thread).
-- `0.3.1`: Use this version if you want to bind RPC handlers to `Rpc`.
+- `0.3`: Use this version if you want to bind RPC handlers to `Rpc`.
