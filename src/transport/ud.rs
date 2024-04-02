@@ -77,6 +77,8 @@ pub(crate) struct UdTransport {
     rx_items: VecDeque<RxItem>,
     /// Number of pending receive work requests to repost.
     rx_repost_pending: usize,
+    /// Rx balance (for debug use).
+    rx_balance: isize,
 }
 
 const CACHELINE_SIZE: usize = 64;
@@ -248,6 +250,7 @@ impl UdTransport {
             rx_wc,
             rx_items,
             rx_repost_pending: 0,
+            rx_balance: 0,
         }
     }
 
@@ -311,7 +314,7 @@ impl UdTransport {
     ///
     /// The items in the batch must all be valid.
     pub unsafe fn tx_burst(&mut self, items: &[TxItem], drain: bool) {
-        if items.is_empty() {
+        if unlikely(items.is_empty()) {
             return;
         }
 
@@ -378,6 +381,22 @@ impl UdTransport {
                 };
             }
 
+            {
+                // DEBUG
+                let pkt_type = unsafe { (*(pkthdr.as_ptr() as *const PacketHeader)).pkt_type() };
+                if matches!(
+                    pkt_type,
+                    crate::pkthdr::PktType::SmallReq | crate::pkthdr::PktType::LargeReq
+                ) {
+                    assert!(
+                        msgbuf.len() >= 16,
+                        "request payload length too-short detected at sender side: {}",
+                        msgbuf.len()
+                    );
+                }
+            }
+
+            // Inline check.
             if length <= self.qp.caps().max_inline_data {
                 wr.send_flags |= ibv_send_flags::IBV_SEND_INLINE.0;
             }
@@ -445,6 +464,7 @@ impl UdTransport {
     pub fn rx_next(&mut self) -> Option<MsgBuf> {
         let RxItem { idx, len } = self.rx_items.pop_front()?;
         let offset = Self::rx_payload_offset(idx as _);
+        self.rx_balance += 1;
 
         // SAFETY: pointer guaranteed not-null, and within the same allocated buffer.
         let data = unsafe {
@@ -468,15 +488,24 @@ impl UdTransport {
     /// - Every `MsgBuf` must not be released more than once.
     #[inline]
     pub unsafe fn rx_release(&mut self, item: &MsgBuf) {
+        self.rx_balance -= 1;
+        assert!(
+            self.rx_balance >= 0,
+            "rx balance underflowed by: {:#?}",
+            item
+        );
+
         let i = self.rx_repost_pending;
 
         // SAFETY: in the same allocated buffer.
-        let idx = item.aux_data as u16 as u64;
-        if idx & AUXDATA_FLAG == 0 {
-            assert_eq!(idx, 0, "invalid aux data");
-            eprintln!("invalid rx buffer to release: {:#?}", item);
-            return;
-        }
+        let idx = item.aux_data;
+        assert_ne!(
+            idx & AUXDATA_FLAG,
+            0,
+            "invalid rx buffer to release: {:#?}",
+            item
+        );
+        let idx = idx as u16 as u64;
 
         self.rx_sgl[i].addr = unsafe { self.rx_buf.ptr.add(Self::rx_offset(idx as usize)) } as _;
         self.rx_wr[i].wr_id = idx;

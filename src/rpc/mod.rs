@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{array, cmp, mem, ptr};
 
-use futures::future::{Future, FutureExt};
+use futures::future::Future;
 use futures::task::noop_waker_ref;
 use rmp_serde as rmps;
 use rrddmma::rdma::qp::QpEndpoint;
@@ -84,7 +84,7 @@ impl RpcInterior {
     pub fn alloc_pkthdr_buf(&mut self) -> MsgBuf {
         let buf = self.slab.alloc(&mut self.tp);
         debug_assert!((buf.as_ptr() as usize) % mem::align_of::<PacketHeader>() == 0);
-        MsgBuf::owned(buf, mem::size_of::<PacketHeader>())
+        MsgBuf::owned_immutable(buf, mem::size_of::<PacketHeader>())
     }
 }
 
@@ -270,6 +270,7 @@ impl Rpc {
         // Use `MsgBuf::clone_borrowed()` to keep the lkey, which is needed when releasing the buffer.
         // This will bury the previous request buffer if it was a large message.
         sslot.req = req_msgbuf.clone_borrowed();
+        sslot.req_borrowed = true;
 
         // Construct the request. This will fetch the raw pointer of the current `Rpc` and `sslot`.
         let request = RequestHandle::new(self, sslot);
@@ -282,7 +283,7 @@ impl Rpc {
         // This will make synchronous handlers return, and push asynchronous handlers
         // into the first yield point.
         let mut cx = Context::from_waker(noop_waker_ref());
-        let response = resp_fut.poll_unpin(&mut cx);
+        let response = resp_fut.as_mut().poll(&mut cx);
 
         // Now we can borrow `state` again.
         let mut real_state = self.state.borrow_mut();
@@ -357,6 +358,7 @@ impl Rpc {
         let data_len = hdr.data_len() as usize;
         let req_buf = state.buddy.alloc(data_len, &mut state.tp);
         sslot.req = MsgBuf::owned_immutable(req_buf, data_len);
+        sslot.req_borrowed = false;
 
         // Downgrade the borrow to SSlot as immutable to make the borrow checker happy.
         let sslot = &sess.slots[sslot_idx];
@@ -392,7 +394,7 @@ impl Rpc {
         // This will make synchronous handlers return, and push asynchronous handlers
         // into the first yield point.
         let mut cx = Context::from_waker(noop_waker_ref());
-        let response = resp_fut.poll_unpin(&mut cx);
+        let response = resp_fut.as_mut().poll(&mut cx);
 
         // Now we can borrow `state` again.
         let mut real_state = self.state.borrow_mut();
@@ -856,7 +858,7 @@ impl Rpc {
         // ... so that we can start to poll the handlers.
         let mut finished_handlers = Vec::with_capacity(pending_handlers.len());
         let mut cx = Context::from_waker(noop_waker_ref());
-        pending_handlers.retain_mut(|resp_fut| match resp_fut.poll_unpin(&mut cx) {
+        pending_handlers.retain_mut(|resp_fut| match resp_fut.handler.as_mut().poll(&mut cx) {
             Poll::Ready(resp) => {
                 finished_handlers.push((resp_fut.sess_id, resp_fut.sslot_idx, resp));
                 false
@@ -888,7 +890,7 @@ impl Rpc {
             // Release the request buffer, but only if it is from the transport layer.
             // We identify this from the `aux_data` field, which is set to `(1 << 32) | idx` for
             // receive buffers from the UD transport.
-            if sslot.req.aux_data > 0 {
+            if sslot.req_borrowed {
                 // SAFETY: this buffer is not released before because:
                 // - `process_small_request()` returns `false`, preventing it from getting
                 //   released in `process_rx()`;

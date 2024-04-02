@@ -19,6 +19,9 @@ pub(crate) struct SSlot {
     /// - For client: this is the user-provided request buffer.
     pub req: MsgBuf,
 
+    /// Whether the request buffer is borrowed from the transport.
+    pub req_borrowed: bool,
+
     /// Pre-allocated MsgBuf for single-packet responses.
     /// Should accommodate the largest possible response, i.e., [`UdTransport::max_data_in_pkt()`].
     ///
@@ -32,8 +35,8 @@ pub(crate) struct SSlot {
     pub resp: MsgBuf,
 
     /// Packet header for the outbound message.
-    /// - For server: response.
-    /// - For client: request.
+    /// - For server: header of response.
+    /// - For client: header of request.
     pub pkthdr: MsgBuf,
 
     /// Whether the request is finished.
@@ -54,6 +57,7 @@ impl SSlot {
             req_idx,
             req_type: 0,
             req: MsgBuf::dummy(),
+            req_borrowed: false,
             pre_resp_msgbuf: match role {
                 SessionRole::Client => MsgBuf::dummy(),
                 SessionRole::Server => state.alloc_msgbuf(UdTransport::max_data_in_pkt()),
