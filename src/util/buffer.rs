@@ -1,3 +1,4 @@
+use std::fmt;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -19,6 +20,23 @@ pub(crate) struct Buffer {
 
     /// Pointer to the buddy allocator.
     owner: Option<Rc<BuddyAllocator>>,
+}
+
+impl fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let owner = if let Some(ref owner) = self.owner {
+            format!("{:p}", owner)
+        } else {
+            "None".to_string()
+        };
+        f.debug_struct("Buffer")
+            .field("buf", &self.buf)
+            .field("len", &self.len)
+            .field("lkey", &self.lkey)
+            .field("rkey", &self.rkey)
+            .field("owner", &owner)
+            .finish()
+    }
 }
 
 impl Buffer {

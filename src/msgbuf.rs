@@ -1,4 +1,4 @@
-use std::mem::{self, MaybeUninit};
+use std::mem;
 use std::ptr::NonNull;
 use std::{ptr, slice};
 
@@ -7,6 +7,7 @@ use crate::transport::{ControlMsg, LKey, RKey, UdTransport};
 use crate::util::{buddy::BuddyAllocator, buffer::*, likely::*};
 
 /// Message buffer that can contain application data for requests and responses.
+#[derive(Debug)]
 pub struct MsgBuf {
     /// Pointer to the first *application data* byte.
     data: NonNull<u8>,
@@ -21,8 +22,8 @@ pub struct MsgBuf {
     /// Backing buffer.
     buffer: Buffer,
 
-    /// Padding to 64 bytes.
-    _padding: MaybeUninit<[u8; 8]>,
+    /// Auxiliary data, also for padding.
+    pub aux_data: u64,
 }
 
 impl MsgBuf {
@@ -77,7 +78,7 @@ impl MsgBuf {
             max_len,
             len: data_len,
             buffer: buf,
-            _padding: MaybeUninit::uninit(),
+            aux_data: 0,
         };
 
         // If short message, return it directly ...
@@ -115,19 +116,19 @@ impl MsgBuf {
             max_len: data_len,
             len: data_len,
             buffer: buf,
-            _padding: MaybeUninit::uninit(),
+            aux_data: 0,
         }
     }
 
     /// Create a new `MsgBuf` on not-owned buffer. It must not be remote-accessible.
     #[inline]
-    pub(crate) fn borrowed(data: NonNull<u8>, data_len: usize, lkey: LKey) -> Self {
+    pub(crate) fn borrowed(data: NonNull<u8>, data_len: usize) -> Self {
         Self {
             data,
             max_len: data_len,
             len: data_len,
-            buffer: Buffer::fake(lkey, 0),
-            _padding: MaybeUninit::uninit(),
+            buffer: Buffer::fake(0, 0),
+            aux_data: 0,
         }
     }
 
@@ -140,7 +141,7 @@ impl MsgBuf {
             max_len: 0,
             len: 0,
             buffer: Buffer::fake(0, 0),
-            _padding: MaybeUninit::uninit(),
+            aux_data: 0,
         }
     }
 
@@ -153,7 +154,7 @@ impl MsgBuf {
             max_len: self.max_len,
             len: self.len,
             buffer: Buffer::fake(self.lkey(), self.rkey()),
-            _padding: MaybeUninit::uninit(),
+            aux_data: self.aux_data,
         }
     }
 
@@ -222,7 +223,13 @@ impl MsgBuf {
 impl MsgBuf {
     /// Return a pointer to the first application data byte.
     #[inline(always)]
-    pub fn as_ptr(&self) -> *mut u8 {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+
+    /// Return a mutable pointer to the first application data byte.
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_ptr()
     }
 

@@ -31,7 +31,11 @@ fn large_req() {
 
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
-                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+                ptr::copy_nonoverlapping(
+                    HELLO_WORLD.as_ptr(),
+                    resp_buf.as_mut_ptr(),
+                    HELLO_WORLD.len(),
+                )
             };
             resp_buf.set_len(HELLO_WORLD.len());
             resp_buf
@@ -52,11 +56,11 @@ fn large_req() {
 
     for _ in 0..10000 {
         // Prepare buffer.
-        let req_buf = rpc.alloc_msgbuf(LARGE_MSG_LEN);
+        let mut req_buf = rpc.alloc_msgbuf(LARGE_MSG_LEN);
         let mut resp_buf = rpc.alloc_msgbuf(16);
 
         // Send request.
-        unsafe { ptr::write_bytes(req_buf.as_ptr(), req_byte, req_buf.len()) };
+        unsafe { ptr::write_bytes(req_buf.as_mut_ptr(), req_byte, req_buf.len()) };
         let request = sess.request(RPC_HELLO, &req_buf, &mut resp_buf);
         block_on(request);
 
@@ -92,8 +96,8 @@ fn large_resp() {
         let nx = Nexus::new(("127.0.0.1", svr_port));
         let mut rpc = Rpc::new(&nx, 2, NIC_NAME, 1);
         rpc.set_handler(RPC_HELLO, move |req| async move {
-            let resp_buf = req.rpc().alloc_msgbuf(LARGE_MSG_LEN);
-            unsafe { ptr::write_bytes(resp_buf.as_ptr(), resp_byte, LARGE_MSG_LEN) };
+            let mut resp_buf = req.rpc().alloc_msgbuf(LARGE_MSG_LEN);
+            unsafe { ptr::write_bytes(resp_buf.as_mut_ptr(), resp_byte, LARGE_MSG_LEN) };
             resp_buf
         });
 
@@ -110,19 +114,21 @@ fn large_resp() {
     let sess = rpc.create_session(("127.0.0.1", svr_port), 2);
     assert!(block_on(sess.connect()));
 
-    // Prepare buffer.
-    let req_buf = rpc.alloc_msgbuf(16);
-    let mut resp_buf = rpc.alloc_msgbuf(50000);
+    for _ in 0..100000 {
+        // Prepare buffer.
+        let mut req_buf = rpc.alloc_msgbuf(16);
+        let mut resp_buf = rpc.alloc_msgbuf(50000);
 
-    // Send request.
-    unsafe { ptr::write_bytes(req_buf.as_ptr(), 0, req_buf.len()) };
-    let request = sess.request(RPC_HELLO, &req_buf, &mut resp_buf);
-    block_on(request);
+        // Send request.
+        unsafe { ptr::write_bytes(req_buf.as_mut_ptr(), 0, req_buf.len()) };
+        let request = sess.request(RPC_HELLO, &req_buf, &mut resp_buf);
+        block_on(request);
 
-    // Validation.
-    assert!(resp_buf.len() == LARGE_MSG_LEN);
-    let payload = unsafe { resp_buf.as_slice() };
-    assert!(payload.iter().all(|&b| b == resp_byte));
+        // Validation.
+        assert!(resp_buf.len() == LARGE_MSG_LEN);
+        let payload = unsafe { resp_buf.as_slice() };
+        assert!(payload.iter().all(|&b| b == resp_byte));
+    }
 
     tx.send(()).unwrap();
     handle.join().unwrap();
@@ -150,7 +156,7 @@ fn nested() {
                 unsafe {
                     ptr::copy_nonoverlapping(
                         HELLO_WORLD.as_ptr(),
-                        resp_buf.as_ptr(),
+                        resp_buf.as_mut_ptr(),
                         HELLO_WORLD.len(),
                     )
                 };
@@ -185,12 +191,12 @@ fn nested() {
                 unsafe {
                     ptr::copy_nonoverlapping(
                         nest_resp_buf1.as_ptr(),
-                        resp_buf.as_ptr(),
+                        resp_buf.as_mut_ptr(),
                         nest_resp_buf1.len(),
                     );
                     ptr::copy_nonoverlapping(
                         nest_resp_buf2.as_ptr(),
-                        resp_buf.as_ptr().add(nest_resp_buf1.len()),
+                        resp_buf.as_mut_ptr().add(nest_resp_buf1.len()),
                         nest_resp_buf2.len(),
                     );
                 }
@@ -221,8 +227,8 @@ fn nested() {
     assert!(block_on(sess.connect()));
 
     // Prepare buffer.
-    let req_buf = rpc.alloc_msgbuf(LARGE_MSG_LEN);
-    unsafe { ptr::write_bytes(req_buf.as_ptr(), 0, LARGE_MSG_LEN) };
+    let mut req_buf = rpc.alloc_msgbuf(LARGE_MSG_LEN);
+    unsafe { ptr::write_bytes(req_buf.as_mut_ptr(), 0, LARGE_MSG_LEN) };
 
     let mut resp_buf = rpc.alloc_msgbuf(64);
 

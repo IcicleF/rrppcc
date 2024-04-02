@@ -20,7 +20,11 @@ fn main() {
         rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
-                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+                ptr::copy_nonoverlapping(
+                    HELLO_WORLD.as_ptr(),
+                    resp_buf.as_mut_ptr(),
+                    HELLO_WORLD.len(),
+                )
             };
             resp_buf.set_len(HELLO_WORLD.len());
             resp_buf

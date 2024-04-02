@@ -23,11 +23,11 @@ use crate::type_alias::*;
 use crate::util::{buddy::*, likely::*, slab::*};
 use crate::{handler::*, msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*};
 
-#[cfg(debug_assertions)]
+// #[cfg(debug_assertions)]
 use std::cell::RefCell as InteriorCell;
 
-#[cfg(not(debug_assertions))]
-use crate::util::unsafe_refcell::UnsafeRefCell as InteriorCell;
+// #[cfg(not(debug_assertions))]
+// use crate::util::unsafe_refcell::UnsafeRefCell as InteriorCell;
 
 /// Interior-mutable state of an [`Rpc`] instance.
 pub(crate) struct RpcInterior {
@@ -459,7 +459,7 @@ impl Rpc {
         sslot.resp.set_len(len);
 
         // SAFETY: source is guaranteed to be valid, destination length checked, may not overlap.
-        unsafe { ptr::copy_nonoverlapping(data, sslot.resp.as_ptr(), len) };
+        unsafe { ptr::copy_nonoverlapping(data, sslot.resp.as_mut_ptr(), len) };
         sslot.finished = true;
     }
 
@@ -885,8 +885,10 @@ impl Rpc {
                 "RequestHandle not dropped after handler finishes"
             );
 
-            // Release the request buffer, but only if it is a large request.
-            if sslot.req.is_small() {
+            // Release the request buffer, but only if it is from the transport layer.
+            // We identify this from the `aux_data` field, which is set to `(1 << 32) | idx` for
+            // receive buffers from the UD transport.
+            if sslot.req.aux_data > 0 {
                 // SAFETY: this buffer is not released before because:
                 // - `process_small_request()` returns `false`, preventing it from getting
                 //   released in `process_rx()`;

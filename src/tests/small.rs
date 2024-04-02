@@ -21,7 +21,11 @@ fn single_req() {
         rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
-                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+                ptr::copy_nonoverlapping(
+                    HELLO_WORLD.as_ptr(),
+                    resp_buf.as_mut_ptr(),
+                    HELLO_WORLD.len(),
+                )
             };
             resp_buf.set_len(HELLO_WORLD.len());
             resp_buf
@@ -79,7 +83,11 @@ fn multiple_reqs() {
             let mut resp_buf = req.pre_resp_buf();
             assert!(resp_buf.len() == 4080);
             unsafe {
-                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+                ptr::copy_nonoverlapping(
+                    HELLO_WORLD.as_ptr(),
+                    resp_buf.as_mut_ptr(),
+                    HELLO_WORLD.len(),
+                )
             };
             resp_buf.set_len(HELLO_WORLD.len());
             resp_buf
@@ -138,7 +146,11 @@ fn concurrent_reqs() {
         rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
-                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+                ptr::copy_nonoverlapping(
+                    HELLO_WORLD.as_ptr(),
+                    resp_buf.as_mut_ptr(),
+                    HELLO_WORLD.len(),
+                )
             };
             resp_buf.set_len(HELLO_WORLD.len());
             resp_buf
@@ -213,7 +225,7 @@ fn nested() {
                 unsafe {
                     ptr::copy_nonoverlapping(
                         HELLO_WORLD.as_ptr(),
-                        resp_buf.as_ptr(),
+                        resp_buf.as_mut_ptr(),
                         HELLO_WORLD.len(),
                     )
                 };
@@ -248,12 +260,12 @@ fn nested() {
                 unsafe {
                     ptr::copy_nonoverlapping(
                         nest_resp_buf1.as_ptr(),
-                        resp_buf.as_ptr(),
+                        resp_buf.as_mut_ptr(),
                         nest_resp_buf1.len(),
                     );
                     ptr::copy_nonoverlapping(
                         nest_resp_buf2.as_ptr(),
-                        resp_buf.as_ptr().add(nest_resp_buf1.len()),
+                        resp_buf.as_mut_ptr().add(nest_resp_buf1.len()),
                         nest_resp_buf2.len(),
                     );
                 }
@@ -290,7 +302,7 @@ fn nested() {
     // Send request.
     let expected = HELLO_WORLD.to_owned() + HELLO_WORLD;
     for _ in 0..100000 {
-        unsafe { ptr::write_bytes(resp_buf.as_ptr(), 0, 16) };
+        unsafe { ptr::write_bytes(resp_buf.as_mut_ptr(), 0, 16) };
 
         let request = sess.request(RPC_HELLO, &req_buf, &mut resp_buf);
         block_on(request);
