@@ -77,6 +77,8 @@ pub(crate) struct UdTransport {
     rx_items: VecDeque<RxItem>,
     /// Number of pending receive work requests to repost.
     rx_repost_pending: usize,
+    /// Rx balance (for debug use).
+    rx_balance: isize,
 }
 
 const AUXDATA_FLAG: u64 = 1 << 32;
@@ -92,7 +94,7 @@ impl UdTransport {
 
     const RQ_SIZE: usize = 1 << 12;
     const RQ_POLL_BATCH: usize = 1 << 4;
-    const RQ_POSTLIST_SIZE: usize = 1 << 6;
+    const RQ_POSTLIST_SIZE: usize = 1 << 4;
     const RX_UNIT_ALLOC_SIZE: usize = CACHELINE_SIZE + Self::MTU;
     const RX_UNIT_SIZE: usize = Self::GRH_SIZE + Self::MTU;
 }
@@ -247,6 +249,7 @@ impl UdTransport {
             rx_wc,
             rx_items,
             rx_repost_pending: 0,
+            rx_balance: 0,
         }
     }
 
@@ -296,6 +299,7 @@ impl UdTransport {
     /// The memory region `[buf, buf + len)` must be valid for access.
     #[cold]
     pub unsafe fn reg_mem(&mut self, buf: *mut u8, len: usize) -> (LKey, RKey) {
+        eprintln!("reg_mem: buf={:?}, len={}", buf, len);
         let mr = Mr::reg(self.qp.pd(), buf, len, Permission::default())
             .expect("failed to register memory region");
         let keys = (mr.lkey(), mr.rkey());
@@ -445,6 +449,7 @@ impl UdTransport {
     pub fn rx_next(&mut self) -> Option<MsgBuf> {
         let RxItem { idx, len } = self.rx_items.pop_front()?;
         let offset = Self::rx_payload_offset(idx as _);
+        self.rx_balance += 1;
 
         // SAFETY: pointer guaranteed not-null, and within the same allocated buffer.
         let data = unsafe {
@@ -468,6 +473,13 @@ impl UdTransport {
     /// - Every `MsgBuf` must not be released more than once.
     #[inline]
     pub unsafe fn rx_release(&mut self, item: &MsgBuf) {
+        self.rx_balance -= 1;
+        assert!(
+            self.rx_balance >= 0,
+            "rx balance underflowed by: {:#?}",
+            item
+        );
+
         let i = self.rx_repost_pending;
 
         // SAFETY: in the same allocated buffer.

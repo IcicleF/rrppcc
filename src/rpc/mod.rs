@@ -23,11 +23,11 @@ use crate::type_alias::*;
 use crate::util::{buddy::*, likely::*, slab::*};
 use crate::{handler::*, msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*};
 
-// #[cfg(debug_assertions)]
+#[cfg(debug_assertions)]
 use std::cell::RefCell as InteriorCell;
 
-// #[cfg(not(debug_assertions))]
-// use crate::util::unsafe_refcell::UnsafeRefCell as InteriorCell;
+#[cfg(not(debug_assertions))]
+use crate::util::unsafe_refcell::UnsafeRefCell as InteriorCell;
 
 /// Interior-mutable state of an [`Rpc`] instance.
 pub(crate) struct RpcInterior {
@@ -89,11 +89,6 @@ impl RpcInterior {
 }
 
 /// Thread-local RPC endpoint.
-///
-/// This type is `Send + Sync` to make compiler happy, but it is actually not.
-/// You may not create or acquire sessions, allocate message buffers, or make
-/// progress from other threads except the one that created the `Rpc`. This is
-/// enforced at runtime and will panic if violated.
 pub struct Rpc {
     /// ID of this RPC instance.
     id: RpcId,
@@ -270,6 +265,7 @@ impl Rpc {
         // Use `MsgBuf::clone_borrowed()` to keep the lkey, which is needed when releasing the buffer.
         // This will bury the previous request buffer if it was a large message.
         sslot.req = req_msgbuf.clone_borrowed();
+        sslot.req_borrowed = true;
 
         // Construct the request. This will fetch the raw pointer of the current `Rpc` and `sslot`.
         let request = RequestHandle::new(self, sslot);
@@ -357,6 +353,7 @@ impl Rpc {
         let data_len = hdr.data_len() as usize;
         let req_buf = state.buddy.alloc(data_len, &mut state.tp);
         sslot.req = MsgBuf::owned_immutable(req_buf, data_len);
+        sslot.req_borrowed = false;
 
         // Downgrade the borrow to SSlot as immutable to make the borrow checker happy.
         let sslot = &sess.slots[sslot_idx];
