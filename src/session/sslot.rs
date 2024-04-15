@@ -32,8 +32,8 @@ pub(crate) struct SSlot {
     pub resp: MsgBuf,
 
     /// Packet header for the outbound message.
-    /// - For server: response.
-    /// - For client: request.
+    /// - For server: header of response.
+    /// - For client: header of request.
     pub pkthdr: MsgBuf,
 
     /// Whether the request is finished.

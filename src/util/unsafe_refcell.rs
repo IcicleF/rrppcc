@@ -1,4 +1,5 @@
 //! Implementation of a fake RefCell that bypasses any safety checks.
+#![allow(dead_code)]
 
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};

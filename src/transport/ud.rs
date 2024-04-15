@@ -79,6 +79,7 @@ pub(crate) struct UdTransport {
     rx_repost_pending: usize,
 }
 
+const AUXDATA_FLAG: u64 = 1 << 32;
 const CACHELINE_SIZE: usize = 64;
 
 impl UdTransport {
@@ -309,7 +310,7 @@ impl UdTransport {
     ///
     /// The items in the batch must all be valid.
     pub unsafe fn tx_burst(&mut self, items: &[TxItem], drain: bool) {
-        if items.is_empty() {
+        if unlikely(items.is_empty()) {
             return;
         }
 
@@ -376,6 +377,7 @@ impl UdTransport {
                 };
             }
 
+            // Inline check.
             if length <= self.qp.caps().max_inline_data {
                 wr.send_flags |= ibv_send_flags::IBV_SEND_INLINE.0;
             }
@@ -451,9 +453,10 @@ impl UdTransport {
             )
         };
 
-        // Embed the index into the unused `lkey` so that we do not need to perform division
-        // to recover it from the pointer during release.
-        Some(MsgBuf::borrowed(data, len as _, idx as _))
+        // Embed the index into the auxiliary data field.
+        let mut msgbuf = MsgBuf::borrowed(data, len as _);
+        msgbuf.aux_data = (idx as u64) | AUXDATA_FLAG;
+        Some(msgbuf)
     }
 
     /// Mark a received message as released and can be reused.
@@ -468,9 +471,17 @@ impl UdTransport {
         let i = self.rx_repost_pending;
 
         // SAFETY: in the same allocated buffer.
-        self.rx_sgl[i].addr =
-            unsafe { self.rx_buf.ptr.add(Self::rx_offset(item.lkey() as _) as _) } as _;
-        self.rx_wr[i].wr_id = item.lkey() as _;
+        let idx = item.aux_data;
+        assert_ne!(
+            idx & AUXDATA_FLAG,
+            0,
+            "invalid rx buffer to release: {:#?}",
+            item
+        );
+        let idx = idx as u16 as u64;
+
+        self.rx_sgl[i].addr = unsafe { self.rx_buf.ptr.add(Self::rx_offset(idx as usize)) } as _;
+        self.rx_wr[i].wr_id = idx;
         self.rx_repost_pending += 1;
 
         if unlikely(self.rx_repost_pending == Self::RQ_POSTLIST_SIZE) {

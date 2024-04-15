@@ -35,13 +35,13 @@ pub fn benchmark_sync(c: &mut Criterion) {
 
         rpc.set_handler(RPC_SMALL, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
-            unsafe { ptr::write_bytes(resp_buf.as_ptr(), 1, SMALL_RPC_LEN) };
+            unsafe { ptr::write_bytes(resp_buf.as_mut_ptr(), 1, SMALL_RPC_LEN) };
             resp_buf.set_len(SMALL_RPC_LEN);
             resp_buf
         });
         rpc.set_handler(RPC_LARGE, |req| async move {
-            let resp_buf = req.rpc().alloc_msgbuf(LARGE_RPC_LEN);
-            unsafe { ptr::write_bytes(resp_buf.as_ptr(), 1, LARGE_RPC_LEN) };
+            let mut resp_buf = req.rpc().alloc_msgbuf(LARGE_RPC_LEN);
+            unsafe { ptr::write_bytes(resp_buf.as_mut_ptr(), 1, LARGE_RPC_LEN) };
             resp_buf
         });
 
@@ -59,9 +59,9 @@ pub fn benchmark_sync(c: &mut Criterion) {
     assert!(block_on(sess.connect()));
 
     // Prepare small buffer.
-    let req_buf = rpc.alloc_msgbuf(SMALL_RPC_LEN);
+    let mut req_buf = rpc.alloc_msgbuf(SMALL_RPC_LEN);
     let mut resp_buf = rpc.alloc_msgbuf(SMALL_RPC_LEN);
-    unsafe { ptr::write_bytes(req_buf.as_ptr(), 1, SMALL_RPC_LEN) };
+    unsafe { ptr::write_bytes(req_buf.as_mut_ptr(), 1, SMALL_RPC_LEN) };
 
     // Benchmark synchronous pingpong-only RPC performance.
     c.bench_function("sync-pingpong", |b| {
@@ -72,9 +72,9 @@ pub fn benchmark_sync(c: &mut Criterion) {
     });
 
     // Prepare large buffer.
-    let req_buf = rpc.alloc_msgbuf(LARGE_RPC_LEN);
+    let mut req_buf = rpc.alloc_msgbuf(LARGE_RPC_LEN);
     let mut resp_buf = rpc.alloc_msgbuf(LARGE_RPC_LEN);
-    unsafe { ptr::write_bytes(req_buf.as_ptr(), 1, LARGE_RPC_LEN) };
+    unsafe { ptr::write_bytes(req_buf.as_mut_ptr(), 1, LARGE_RPC_LEN) };
 
     // Benchmark synchronous large RPC performance.
     c.bench_function("sync-pingpong-large", |b| {

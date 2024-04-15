@@ -19,9 +19,9 @@ pub(self) fn next_port() -> u16 {
     PORT.fetch_add(1, Ordering::SeqCst)
 }
 
-const NIC_NAME: &str = "mlx5_0";
+const NIC_NAME: &str = "mlx5_2";
 
 mod control_plane;
 mod corners;
-mod large_simple;
-mod small_simple;
+mod large;
+mod small;

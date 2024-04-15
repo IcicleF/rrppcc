@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{array, cmp, mem, ptr};
 
-use futures::future::{Future, FutureExt};
+use futures::future::Future;
 use futures::task::noop_waker_ref;
 use rmp_serde as rmps;
 use rrddmma::rdma::qp::QpEndpoint;
@@ -23,11 +23,11 @@ use crate::type_alias::*;
 use crate::util::{buddy::*, likely::*, slab::*};
 use crate::{handler::*, msgbuf::*, nexus::*, pkthdr::*, request::*, session::*, transport::*};
 
-#[cfg(debug_assertions)]
+// #[cfg(debug_assertions)]
 use std::cell::RefCell as InteriorCell;
 
-#[cfg(not(debug_assertions))]
-use crate::util::unsafe_refcell::UnsafeRefCell as InteriorCell;
+// #[cfg(not(debug_assertions))]
+// use crate::util::unsafe_refcell::UnsafeRefCell as InteriorCell;
 
 /// Interior-mutable state of an [`Rpc`] instance.
 pub(crate) struct RpcInterior {
@@ -84,7 +84,7 @@ impl RpcInterior {
     pub fn alloc_pkthdr_buf(&mut self) -> MsgBuf {
         let buf = self.slab.alloc(&mut self.tp);
         debug_assert!((buf.as_ptr() as usize) % mem::align_of::<PacketHeader>() == 0);
-        MsgBuf::owned(buf, mem::size_of::<PacketHeader>())
+        MsgBuf::owned_immutable(buf, mem::size_of::<PacketHeader>())
     }
 }
 
@@ -282,7 +282,7 @@ impl Rpc {
         // This will make synchronous handlers return, and push asynchronous handlers
         // into the first yield point.
         let mut cx = Context::from_waker(noop_waker_ref());
-        let response = resp_fut.poll_unpin(&mut cx);
+        let response = resp_fut.as_mut().poll(&mut cx);
 
         // Now we can borrow `state` again.
         let mut real_state = self.state.borrow_mut();
@@ -392,7 +392,7 @@ impl Rpc {
         // This will make synchronous handlers return, and push asynchronous handlers
         // into the first yield point.
         let mut cx = Context::from_waker(noop_waker_ref());
-        let response = resp_fut.poll_unpin(&mut cx);
+        let response = resp_fut.as_mut().poll(&mut cx);
 
         // Now we can borrow `state` again.
         let mut real_state = self.state.borrow_mut();
@@ -459,7 +459,7 @@ impl Rpc {
         sslot.resp.set_len(len);
 
         // SAFETY: source is guaranteed to be valid, destination length checked, may not overlap.
-        unsafe { ptr::copy_nonoverlapping(data, sslot.resp.as_ptr(), len) };
+        unsafe { ptr::copy_nonoverlapping(data, sslot.resp.as_mut_ptr(), len) };
         sslot.finished = true;
     }
 
@@ -856,7 +856,7 @@ impl Rpc {
         // ... so that we can start to poll the handlers.
         let mut finished_handlers = Vec::with_capacity(pending_handlers.len());
         let mut cx = Context::from_waker(noop_waker_ref());
-        pending_handlers.retain_mut(|resp_fut| match resp_fut.poll_unpin(&mut cx) {
+        pending_handlers.retain_mut(|resp_fut| match resp_fut.handler.as_mut().poll(&mut cx) {
             Poll::Ready(resp) => {
                 finished_handlers.push((resp_fut.sess_id, resp_fut.sslot_idx, resp));
                 false
@@ -885,13 +885,16 @@ impl Rpc {
                 "RequestHandle not dropped after handler finishes"
             );
 
-            // Release the request buffer.
-            // SAFETY: this buffer is not released before because:
-            // - `process_small_request()` returns `false`, preventing it from getting
-            //   released in `process_rx()`;
-            // - previous polls to the handler future gives `Pending`, not doing anything
-            //   to this buffer.
-            unsafe { state.tp.rx_release(&sslot.req) };
+            // Release the request buffer, but only if it is from the transport layer.
+            // This applys to all small requests, but for correctness we also check its `aux_data`.
+            if sslot.req.is_small() && sslot.req.aux_data > 0 {
+                // SAFETY: this buffer is not released before because:
+                // - `process_small_request()` returns `false`, preventing it from getting
+                //   released in `process_rx()`;
+                // - previous polls to the handler future gives `Pending`, not doing anything
+                //   to this buffer.
+                unsafe { state.tp.rx_release(&sslot.req) };
+            }
 
             do_response_tx!(ENQUEUE, state, sess, sslot, resp);
         }

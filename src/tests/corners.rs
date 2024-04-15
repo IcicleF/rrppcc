@@ -67,7 +67,9 @@ fn shared_req() {
         rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             let req_buf = req.req_buf();
-            unsafe { ptr::copy_nonoverlapping(req_buf.as_ptr(), resp_buf.as_ptr(), req_buf.len()) };
+            unsafe {
+                ptr::copy_nonoverlapping(req_buf.as_ptr(), resp_buf.as_mut_ptr(), req_buf.len())
+            };
             resp_buf.set_len(req_buf.len());
             resp_buf
         });
@@ -87,8 +89,8 @@ fn shared_req() {
 
     // Single shared request.
     let magic_byte = rand::random::<u8>();
-    let req_buf = rpc.alloc_msgbuf(8);
-    unsafe { ptr::write_bytes(req_buf.as_ptr(), magic_byte, req_buf.len()) };
+    let mut req_buf = rpc.alloc_msgbuf(8);
+    unsafe { ptr::write_bytes(req_buf.as_mut_ptr(), magic_byte, req_buf.len()) };
 
     // Multiple response buffers.
     const N: usize = 64;
@@ -131,7 +133,11 @@ fn aborting_reqs() {
         rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
-                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+                ptr::copy_nonoverlapping(
+                    HELLO_WORLD.as_ptr(),
+                    resp_buf.as_mut_ptr(),
+                    HELLO_WORLD.len(),
+                )
             };
             resp_buf.set_len(HELLO_WORLD.len());
             resp_buf
@@ -214,7 +220,11 @@ fn moving_req_handle() {
         rpc.set_handler(RPC_HELLO, |req| async move {
             let mut resp_buf = req.pre_resp_buf();
             unsafe {
-                ptr::copy_nonoverlapping(HELLO_WORLD.as_ptr(), resp_buf.as_ptr(), HELLO_WORLD.len())
+                ptr::copy_nonoverlapping(
+                    HELLO_WORLD.as_ptr(),
+                    resp_buf.as_mut_ptr(),
+                    HELLO_WORLD.len(),
+                )
             };
             std::mem::forget(req);
 
